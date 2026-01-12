@@ -6,6 +6,8 @@ object BreadcrumbManager {
     private const val MAX_BREADCRUMBS = 100
     private val breadcrumbs = ConcurrentLinkedQueue<Breadcrumb>()
 
+    @JvmStatic
+    @JvmOverloads
     fun addBreadcrumb(
         category: String,
         message: String,
@@ -28,10 +30,12 @@ object BreadcrumbManager {
         }
     }
 
+    @JvmStatic
     fun getBreadcrumbs(): List<Breadcrumb> {
         return breadcrumbs.toList()
     }
 
+    @JvmStatic
     fun clear() {
         breadcrumbs.clear()
     }

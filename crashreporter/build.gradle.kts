@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "com.crashreporter.library"
     compileSdk = 34
+    ndkVersion = "27.0.11902837"  // Using installed NDK r27
 
     defaultConfig {
         minSdk = 21
@@ -13,6 +14,25 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
+
+        // Enable NDK for native crash handling
+        ndk {
+            abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags("-std=c++17", "-funwind-tables", "-fno-omit-frame-pointer")
+                arguments("-DANDROID_STL=c++_shared")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {

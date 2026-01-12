@@ -1,0 +1,212 @@
+package com.crashreporter.library
+
+import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+/**
+ * Main entry point for the Crash Reporter Library
+ *
+ * Usage from Unity (C#):
+ * AndroidJavaClass crashReporter = new AndroidJavaClass("com.crashreporter.library.CrashReporter");
+ * crashReporter.CallStatic("initialize", context, "https://your-api.com");
+ */
+object CrashReporter {
+
+    private var isInitialized = false
+    private lateinit var crashHandler: CrashHandler
+    private lateinit var crashStorage: CrashStorage
+    private lateinit var crashSender: CrashSender
+    private lateinit var deviceInfoCollector: DeviceInfoCollector
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    /**
+     * Initialize the crash reporter
+     *
+     * @param context Android application context
+     * @param apiEndpoint The base URL of your crash reporting API (e.g., "https://api.example.com")
+     */
+    @JvmStatic
+    fun initialize(context: Context, apiEndpoint: String) {
+        if (isInitialized) {
+            android.util.Log.w("CrashReporter", "Already initialized, skipping...")
+            return
+        }
+
+        try {
+            val appContext = context.applicationContext
+
+            // Initialize components
+            crashStorage = CrashStorage(appContext)
+            crashSender = CrashSender(apiEndpoint, crashStorage)
+            deviceInfoCollector = DeviceInfoCollector(appContext)
+            crashHandler = CrashHandler(
+                context = appContext,
+                crashStorage = crashStorage,
+                crashSender = crashSender,
+                deviceInfoCollector = deviceInfoCollector
+            )
+
+            // Set up the uncaught exception handler
+            Thread.setDefaultUncaughtExceptionHandler(crashHandler)
+
+            // Initialize native crash handler
+            try {
+                NativeCrashHandler.initialize(appContext)
+                android.util.Log.i("CrashReporter", "Native crash handler initialized")
+            } catch (e: Exception) {
+                android.util.Log.w("CrashReporter", "Failed to initialize native crash handler: ${e.message}")
+            }
+
+            // Process any pending native crashes from previous session
+            processNativeCrash()
+
+            // Send any pending crashes from previous sessions
+            sendPendingCrashes()
+
+            isInitialized = true
+            android.util.Log.i("CrashReporter", "Crash Reporter initialized successfully")
+
+        } catch (e: Exception) {
+            android.util.Log.e("CrashReporter", "Failed to initialize: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Send all pending crashes that were saved from previous sessions
+     */
+    private fun sendPendingCrashes() {
+        scope.launch {
+            try {
+                crashSender.sendAllPendingCrashes()
+            } catch (e: Exception) {
+                android.util.Log.e("CrashReporter", "Error sending pending crashes: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * Manually trigger sending pending crashes (optional, for testing)
+     */
+    @JvmStatic
+    fun sendPendingCrashesNow() {
+        sendPendingCrashes()
+    }
+
+    /**
+     * Check if the crash reporter is initialized
+     */
+    @JvmStatic
+    fun isInitialized(): Boolean = isInitialized
+
+    /**
+     * Get the number of pending crashes waiting to be sent
+     */
+    @JvmStatic
+    fun getPendingCrashCount(): Int {
+        return if (::crashStorage.isInitialized) {
+            crashStorage.getPendingCrashFiles().size
+        } else {
+            0
+        }
+    }
+
+    /**
+     * Process native crash from previous session
+     */
+    private fun processNativeCrash() {
+        scope.launch {
+            try {
+                val nativeCrashFile = NativeCrashHandler.getPendingNativeCrash()
+                if (nativeCrashFile != null) {
+                    android.util.Log.i("CrashReporter", "Found native crash from previous session")
+
+                    // Read native crash file
+                    val nativeCrashContent = nativeCrashFile.readText()
+
+                    // Parse and create crash data
+                    val crashData = parseNativeCrash(nativeCrashContent)
+
+                    // Save as JSON crash report
+                    crashStorage.saveCrash(crashData)
+
+                    // Try to send immediately
+                    val success = crashSender.sendCrash(crashData)
+                    if (success) {
+                        android.util.Log.i("CrashReporter", "Native crash sent successfully")
+                        NativeCrashHandler.deleteNativeCrashFile()
+                    } else {
+                        android.util.Log.w("CrashReporter", "Failed to send native crash, will retry later")
+                        // Keep the crash file for next retry
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("CrashReporter", "Error processing native crash: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * Parse native crash file and create CrashData
+     */
+    private fun parseNativeCrash(content: String): CrashData {
+        val lines = content.split("\n")
+        var signal = "UNKNOWN"
+        var description = "Native crash"
+        var faultAddress = "unknown"
+        var threadName = "unknown"
+        var stackTrace = ""
+
+        for (line in lines) {
+            when {
+                line.startsWith("Signal:") -> {
+                    signal = line.substringAfter("Signal:").trim()
+                }
+                line.startsWith("Description:") -> {
+                    description = line.substringAfter("Description:").trim()
+                }
+                line.startsWith("Fault Address:") -> {
+                    faultAddress = line.substringAfter("Fault Address:").trim()
+                }
+                line.startsWith("Thread:") -> {
+                    threadName = line.substringAfter("Thread:").trim()
+                }
+                line.startsWith("Stack Trace:") || line.startsWith("#") -> {
+                    stackTrace += line + "\n"
+                }
+            }
+        }
+
+        return CrashData(
+            crashId = java.util.UUID.randomUUID().toString(),
+            timestamp = System.currentTimeMillis(),
+            exceptionType = signal,
+            exceptionMessage = "$description at $faultAddress",
+            stackTrace = stackTrace.ifEmpty { content },
+            threadName = threadName,
+            deviceInfo = deviceInfoCollector.getDeviceInfo(),
+            appInfo = deviceInfoCollector.getAppInfo(),
+            deviceState = deviceInfoCollector.getDeviceState(),
+            networkInfo = deviceInfoCollector.getNetworkInfo(),
+            memoryInfo = deviceInfoCollector.getMemoryInfo(),
+            cpuInfo = deviceInfoCollector.getCpuInfo(),
+            processInfo = deviceInfoCollector.getProcessInfo(),
+            allThreads = emptyList(), // Native crash doesn't have all threads
+            breadcrumbs = BreadcrumbManager.getBreadcrumbs(),
+            customData = CustomDataManager.getCustomData(),
+            environment = CustomDataManager.getEnvironment()
+        )
+    }
+
+    /**
+     * Trigger a native crash for testing (dangerous!)
+     * @param type 0=SIGSEGV, 1=SIGABRT, 2=SIGFPE, 3=Invalid memory, 4=Stack overflow
+     */
+    @JvmStatic
+    fun triggerNativeCrash(type: Int) {
+        android.util.Log.w("CrashReporter", "⚠️ Triggering native crash type: $type")
+        NativeCrashHandler.triggerTestCrash(type)
+    }
+}
