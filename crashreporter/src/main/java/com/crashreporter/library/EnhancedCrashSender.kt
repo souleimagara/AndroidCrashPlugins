@@ -31,8 +31,9 @@ class EnhancedCrashSender(
         // CRITICAL: Exclude null, empty strings, and empty collections
         // Reduces payload size by 300-400 bytes per crash (~3-5%)
         // With compression: ~50-100 bytes savings
-        .registerTypeAdapter(CrashData::class.java, PayloadOptimizationSerializer())
-        .serializeNulls()  // Gson will serialize nulls, but serializer will remove them
+        // Uses TypeAdapterFactory pattern to avoid infinite recursion
+        .registerTypeAdapterFactory(PayloadOptimizationAdapterFactory())
+        .serializeNulls()  // Gson will serialize nulls, but adapter will remove them
         .create()
 
     companion object {
@@ -214,9 +215,11 @@ class EnhancedCrashSender(
                     val crashData = crashStorage.loadCrash(crashId)
 
                     if (crashData != null) {
-                        val success = sendCrash(crashData)
+                        // CRITICAL: Use processCrash() instead of sendCrash() to enable deduplication
+                        // This ensures crashes loaded from disk go through the same dedup logic as fresh crashes
+                        val success = processCrash(crashData)
                         if (!success) {
-                            android.util.Log.w("EnhancedCrashSender", "Failed to send crash: $crashId (will retry later)")
+                            android.util.Log.w("EnhancedCrashSender", "Failed to process crash: $crashId (will retry later)")
                         }
                     } else {
                         android.util.Log.w("EnhancedCrashSender", "Failed to load crash from ${file.name}")

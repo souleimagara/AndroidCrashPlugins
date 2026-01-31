@@ -353,10 +353,10 @@ object EnhancedCrashReporter {
             // ════════════════════════════════════════════════════════════
             scope.launch {
                 try {
-                    crashSender.sendCrash(updatedCrashData)
-                    android.util.Log.i("EnhancedCrashReporter", "✅ ANR report sent to webhook")
+                    crashSender.processCrash(updatedCrashData)
+                    android.util.Log.i("EnhancedCrashReporter", "✅ ANR report processed successfully")
                 } catch (e: Exception) {
-                    android.util.Log.e("EnhancedCrashReporter", "Error sending ANR crash (will retry on next session)", e)
+                    android.util.Log.e("EnhancedCrashReporter", "Error processing ANR crash (will retry on next session)", e)
                     // Crash is already persisted, so this failure is not critical
                 }
             }
@@ -420,12 +420,12 @@ object EnhancedCrashReporter {
 
                     crashStorage.saveCrash(crashData)
 
-                    val success = crashSender.sendCrash(crashData)
+                    val success = crashSender.processCrash(crashData)
                     if (success) {
-                        android.util.Log.i("EnhancedCrashReporter", "✅ Native crash sent successfully")
+                        android.util.Log.i("EnhancedCrashReporter", "✅ Native crash processed successfully")
                         NativeCrashHandler.deleteNativeCrashFile()
                     } else {
-                        android.util.Log.w("EnhancedCrashReporter", "⚠️ Failed to send native crash, will retry later")
+                        android.util.Log.w("EnhancedCrashReporter", "⚠️ Failed to process native crash, will retry later")
                     }
                 }
             } catch (e: Exception) {
@@ -723,10 +723,10 @@ object EnhancedCrashReporter {
 
                     android.util.Log.i("EnhancedCrashReporter", "📱 Managed exception saved to disk")
 
-                    // Send to webhook
-                    android.util.Log.d("EnhancedCrashReporter", "📱 Sending managed exception to webhook...")
-                    crashSender.sendCrash(updatedCrashData)
-                    android.util.Log.i("EnhancedCrashReporter", "✅ Managed exception sent to webhook successfully")
+                    // Send to webhook with deduplication
+                    android.util.Log.d("EnhancedCrashReporter", "📱 Sending managed exception to webhook (with dedup)...")
+                    crashSender.processCrash(updatedCrashData)
+                    android.util.Log.i("EnhancedCrashReporter", "✅ Managed exception processed successfully")
                 } catch (e: Exception) {
                     android.util.Log.e("EnhancedCrashReporter", "❌ Error handling managed exception (will retry later): ${e.message}", e)
                 }

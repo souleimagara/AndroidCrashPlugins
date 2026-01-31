@@ -1,6 +1,7 @@
 package com.crashreporter.library
 
 import java.security.MessageDigest
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
@@ -40,7 +41,7 @@ object CrashGrouping {
     private val sessionFingerprints = ConcurrentHashMap<String, AtomicInteger>()
 
     /** Fingerprints already fully reported this session (in-memory only) */
-    private val reportedFingerprints = ConcurrentHashMap.newKeySet<String>()
+    private val reportedFingerprints = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     /** Persistent storage for fingerprints (survives crashes!) */
     private var persistentStorage: FingerprintStorage? = null
@@ -231,7 +232,13 @@ object CrashGrouping {
     }
 
     private fun trackFingerprint(fingerprint: String): Int {
-        return sessionFingerprints.computeIfAbsent(fingerprint) { AtomicInteger(0) }.incrementAndGet()
+        // API 21 compatible: use get() + put() instead of computeIfAbsent()
+        val existing = sessionFingerprints[fingerprint]
+        val counter = existing ?: AtomicInteger(0)
+        if (existing == null) {
+            sessionFingerprints[fingerprint] = counter
+        }
+        return counter.incrementAndGet()
     }
 
     private fun isAlreadyReported(fingerprint: String): Boolean {

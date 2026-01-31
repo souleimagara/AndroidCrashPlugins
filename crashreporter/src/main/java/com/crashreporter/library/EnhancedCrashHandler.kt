@@ -55,13 +55,13 @@ class EnhancedCrashHandler(
                 }
             }
 
-            // Try to send immediately (non-blocking, best effort)
+            // Try to process immediately with deduplication (non-blocking, best effort)
             runBlocking {
                 try {
-                    crashSender.sendCrash(crashData)
+                    crashSender.processCrash(crashData)
                 } catch (e: Exception) {
-                    android.util.Log.d("EnhancedCrashHandler", "Failed to send crash immediately: ${e.message}")
-                    // OK if fails, will be sent on next app launch
+                    android.util.Log.d("EnhancedCrashHandler", "Failed to process crash immediately: ${e.message}")
+                    // OK if fails, will be processed on next app launch
                 }
             }
 
