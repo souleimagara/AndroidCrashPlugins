@@ -28,12 +28,7 @@ class EnhancedCrashSender(
 
     private val gson: Gson = GsonBuilder()
         .disableHtmlEscaping()
-        // CRITICAL: Exclude null, empty strings, and empty collections
-        // Reduces payload size by 300-400 bytes per crash (~3-5%)
-        // With compression: ~50-100 bytes savings
-        // Uses TypeAdapterFactory pattern to avoid infinite recursion
-        .registerTypeAdapterFactory(PayloadOptimizationAdapterFactory())
-        .serializeNulls()  // Gson will serialize nulls, but adapter will remove them
+        .serializeNulls()
         .create()
 
     companion object {

@@ -37,9 +37,9 @@ class FingerprintStorage(private val context: Context) {
             val lastReportedTime = fingerprints[fingerprint] ?: return false
             val now = System.currentTimeMillis()
             val ageMs = now - lastReportedTime
-            val sevenDaysMs = 7 * 24 * 60 * 60 * 1000L
+            val oneDayMs = 24 * 60 * 60 * 1000L
 
-            val wasRecent = ageMs < sevenDaysMs
+            val wasRecent = ageMs < oneDayMs
             if (wasRecent) {
                 android.util.Log.d(
                     "FingerprintStorage",
@@ -153,18 +153,18 @@ class FingerprintStorage(private val context: Context) {
     }
 
     /**
-     * Remove fingerprints older than 7 days
+     * Remove fingerprints older than 24 hours
      * Called automatically during load and periodically
      */
     private fun cleanup() {
         synchronized(lock) {
             val now = System.currentTimeMillis()
-            val sevenDaysMs = 7 * 24 * 60 * 60 * 1000L
-            val sevenDaysAgo = now - sevenDaysMs
+            val oneDayMs = 24 * 60 * 60 * 1000L
+            val oneDayAgo = now - oneDayMs
 
             val before = fingerprints.size
             fingerprints.entries.removeAll { (_, timestamp) ->
-                timestamp < sevenDaysAgo
+                timestamp < oneDayAgo
             }
             val after = fingerprints.size
             val removed = before - after

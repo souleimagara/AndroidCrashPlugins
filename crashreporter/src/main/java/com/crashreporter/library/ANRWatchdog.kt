@@ -198,14 +198,14 @@ class ANRWatchdog(
 
                 when {
                     isPowerSaveActive || isBatteryLow -> {
-                        // Power save mode: sleep for 20 seconds before checking
-                        android.util.Log.d("ANRWatchdog", "💤 Power save active - sleeping 20000ms before ANR check")
-                        20000L
+                        // Power save mode: extend by 5 seconds to account for CPU throttling
+                        val extended = timeoutMs + 5000L
+                        android.util.Log.d("ANRWatchdog", "💤 Power save active - sleeping ${extended}ms before ANR check")
+                        extended
                     }
                     else -> {
-                        // Normal mode: sleep for 15 seconds before checking
-                        android.util.Log.d("ANRWatchdog", "💤 Normal mode - sleeping 15000ms before ANR check")
-                        15000L
+                        android.util.Log.d("ANRWatchdog", "💤 Normal mode - sleeping ${timeoutMs}ms before ANR check")
+                        timeoutMs
                     }
                 }
             } else {
@@ -232,21 +232,19 @@ class ANRWatchdog(
 
                 when {
                     isPowerSaveActive || isBatteryLow -> {
-                        // Power save mode: require 20+ seconds of blocked main thread
-                        20000L
+                        // Power save mode: extend by 5 seconds for CPU throttling
+                        timeoutMs + 5000L
                     }
                     else -> {
-                        // Normal mode: require 15+ seconds of blocked main thread
-                        // Captures real freezes while allowing for slow network operations
-                        15000L
+                        timeoutMs
                     }
                 }
             } else {
-                15000L
+                timeoutMs
             }
         } catch (e: Exception) {
             android.util.Log.e("ANRWatchdog", "Error calculating ANR threshold: ${e.message}", e)
-            15000L
+            timeoutMs
         }
     }
 }

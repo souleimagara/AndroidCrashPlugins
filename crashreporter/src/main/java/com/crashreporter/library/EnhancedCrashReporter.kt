@@ -5,6 +5,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 
 /**
@@ -35,8 +37,7 @@ object EnhancedCrashReporter {
     private lateinit var deviceInfoCollector: EnhancedDeviceInfoCollector
     private lateinit var startupCrashDetector: StartupCrashDetector
     private lateinit var anrWatchdog: ANRWatchdog
-    private lateinit var anrValidationEngine: ANRValidationEngine  // ADD THIS
-    private lateinit var screenStateReceiver: ScreenStateReceiver
+    private lateinit var anrValidationEngine: ANRValidationEngine
     private var memoryWarningTracker: MemoryWarningTracker? = null
     private var reachabilityTracker: ReachabilityTracker? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -151,21 +152,9 @@ object EnhancedCrashReporter {
                 )
                 anrWatchdog.start()
                 android.util.Log.i("EnhancedCrashReporter", "✅ ANR watchdog started with multi-factor validation")
-
-                // Register screen state receiver to auto-pause ANR detection
-                try {
-                    this.appContext = appContext
-                    screenStateReceiver = ScreenStateReceiver()
-                    val filter = android.content.IntentFilter().apply {
-                        addAction(android.content.Intent.ACTION_SCREEN_ON)
-                        addAction(android.content.Intent.ACTION_SCREEN_OFF)
-                        addAction(android.content.Intent.ACTION_USER_PRESENT)
-                    }
-                    appContext.registerReceiver(screenStateReceiver, filter)
-                    android.util.Log.i("EnhancedCrashReporter", "✅ Screen state receiver registered (auto ANR pause/resume)")
-                } catch (e: Exception) {
-                    android.util.Log.w("EnhancedCrashReporter", "Failed to register screen state receiver: ${e.message}")
-                }
+                // Note: ANR pause/resume on focus-loss is handled by Unity's OnApplicationFocus
+                // → pauseANRDetection() / resumeANRDetection() JNI calls, so no screen state
+                // receiver is needed here.
             }
 
             // Cleanup old crashes
@@ -471,23 +460,41 @@ object EnhancedCrashReporter {
             }
         }
 
-        // Add operation tracking data to custom data for SLO monitoring
-        val customDataWithOperations = CustomDataManager.getCustomData().toMutableMap()
-        try {
-            val currentOp = OperationTracker.getCurrentOperation()
-            val lastSuccessOp = OperationTracker.getLastSuccessfulOperation()
-            val lastFailedOp = OperationTracker.getLastFailedOperation()
-            val lastFailureReason = OperationTracker.getLastFailureReason()
+        // Restore SDK context from disk. On a fresh process (after a native signal crash
+        // killed the previous one), all OperationTracker singletons are empty. We wrote
+        // a context snapshot to disk every 5 seconds via persistContextForNativeCrashRecovery(),
+        // so we can recover the SDK state that was active when the crash happened.
+        val persistedCtx = loadPersistedContext()
+        val restoredCurrentOp = persistedCtx?.optString("currentOperation")?.takeIf { it.isNotEmpty() }
+            ?: OperationTracker.getCurrentOperation()
+        val restoredLastSuccess = persistedCtx?.optString("lastSuccessfulOperation")?.takeIf { it.isNotEmpty() }
+            ?: OperationTracker.getLastSuccessfulOperation()
+        val restoredLastFailed = persistedCtx?.optString("lastFailedOperation")?.takeIf { it.isNotEmpty() }
+            ?: OperationTracker.getLastFailedOperation()
+        val restoredFailureReason = persistedCtx?.optString("lastFailureReason")?.takeIf { it.isNotEmpty() }
+            ?: OperationTracker.getLastFailureReason()
+        val restoredSdkVersion = persistedCtx?.optString("sdkVersion")?.takeIf { it.isNotEmpty() }
+            ?: OperationTracker.getSDKVersion()
+        val restoredInitFailurePoint = persistedCtx?.optString("initFailurePoint")?.takeIf { it.isNotEmpty() }
+            ?: OperationTracker.getInitFailurePoint()
 
-            customDataWithOperations["currentOperation"] = currentOp ?: "none"
-            customDataWithOperations["lastSuccessfulOperation"] = lastSuccessOp ?: "none"
-            customDataWithOperations["lastFailedOperation"] = lastFailedOp ?: "none"
-            customDataWithOperations["lastOperationError"] = lastFailureReason ?: "none"
-
-            android.util.Log.d("EnhancedCrashReporter", "📊 Operation tracking added to native crash report")
-        } catch (e: Exception) {
-            android.util.Log.w("EnhancedCrashReporter", "Failed to get operation tracking for native crash: ${e.message}")
+        if (persistedCtx != null) {
+            android.util.Log.i("EnhancedCrashReporter", "✅ Restored SDK context from disk for native crash report")
         }
+
+        val customDataWithOperations = CustomDataManager.getCustomData().toMutableMap()
+
+        // Merge persisted custom data (init stages, user IDs, webview state etc.)
+        persistedCtx?.optJSONObject("customData")?.let { savedCustomData ->
+            savedCustomData.keys().forEach { key ->
+                customDataWithOperations[key] = savedCustomData.getString(key)
+            }
+        }
+
+        customDataWithOperations["currentOperation"] = restoredCurrentOp ?: "none"
+        customDataWithOperations["lastSuccessfulOperation"] = restoredLastSuccess ?: "none"
+        customDataWithOperations["lastFailedOperation"] = restoredLastFailed ?: "none"
+        customDataWithOperations["lastOperationError"] = restoredFailureReason ?: "none"
 
         val crashData = CrashData(
             crashId = UUID.randomUUID().toString(),
@@ -535,14 +542,14 @@ object EnhancedCrashReporter {
             sdCardInfo = deviceInfoCollector.getExternalSDCardInfo(),
             diskPerformance = deviceInfoCollector.getDiskPerformance(),
 
-            // SDK Context (Common SLO fields)
-            sdkVersion = OperationTracker.getSDKVersion(),
+            // SDK Context — use persisted values so native crash reports have real context
+            sdkVersion = restoredSdkVersion,
             crashReporterPluginVersion = OperationTracker.getCrashReporterPluginVersion(),
             platform = OperationTracker.getPlatform(),
             isSDKRelated = OperationTracker.isSDKRelatedCrash(stackTrace),
             responsibleSDKComponent = OperationTracker.determineResponsibleComponent(stackTrace),
-            initFailurePoint = OperationTracker.getInitFailurePoint(),
-            currentOperation = OperationTracker.getCurrentOperation() ?: "",
+            initFailurePoint = restoredInitFailurePoint,
+            currentOperation = restoredCurrentOp ?: "",
             operationContext = OperationTracker.getOperationContext()
         )
 
@@ -764,23 +771,69 @@ object EnhancedCrashReporter {
     }
 
     /**
+     * Persist current SDK context (OperationTracker + CustomDataManager) to disk so that
+     * native signal crash recovery can read it on the next app launch.
+     *
+     * WHY: When a native signal crash (SIGSEGV, SIGABRT etc.) kills the process, the next
+     * launch starts a fresh JVM with empty singletons. parseNativeCrash() would read
+     * OperationTracker.getCurrentOperation() etc. and get "none" for all fields.
+     * By periodically persisting context to disk (called every 5s from Unity C# bridge),
+     * we ensure the last known SDK state survives the crash and appears in the report.
+     *
+     * Called from Unity via JNI: ZBDAndroidCrashBridge.SendSDKContextToNative()
+     */
+    @JvmStatic
+    fun persistContextForNativeCrashRecovery() {
+        try {
+            val ctx = appContext ?: return
+            val contextFile = File(ctx.filesDir, "zbd_crash_context.json")
+
+            val json = JSONObject().apply {
+                put("currentOperation", OperationTracker.getCurrentOperation() ?: "")
+                put("lastSuccessfulOperation", OperationTracker.getLastSuccessfulOperation() ?: "")
+                put("lastFailedOperation", OperationTracker.getLastFailedOperation() ?: "")
+                put("lastFailureReason", OperationTracker.getLastFailureReason() ?: "")
+                put("sdkVersion", OperationTracker.getSDKVersion())
+                put("initFailurePoint", OperationTracker.getInitFailurePoint())
+                put("timestamp", System.currentTimeMillis())
+
+                // Custom tags from SDK (includes init stages, user IDs, webview state etc.
+                // pushed by ZBDAndroidCrashBridge.SendSDKContextToNative)
+                val customDataJson = JSONObject()
+                CustomDataManager.getCustomData().forEach { (k, v) -> customDataJson.put(k, v) }
+                put("customData", customDataJson)
+            }
+
+            contextFile.writeText(json.toString())
+            android.util.Log.d("EnhancedCrashReporter", "✅ SDK context persisted for native crash recovery")
+        } catch (e: Exception) {
+            android.util.Log.w("EnhancedCrashReporter", "Failed to persist context: ${e.message}")
+        }
+    }
+
+    /**
+     * Load previously persisted SDK context from disk.
+     * Used by parseNativeCrash() to restore context that was active before the crash.
+     */
+    private fun loadPersistedContext(): JSONObject? {
+        return try {
+            val ctx = appContext ?: return null
+            val contextFile = File(ctx.filesDir, "zbd_crash_context.json")
+            if (!contextFile.exists()) return null
+            JSONObject(contextFile.readText())
+        } catch (e: Exception) {
+            android.util.Log.w("EnhancedCrashReporter", "Failed to load persisted context: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * Stop the crash reporter
      */
     @JvmStatic
     fun shutdown() {
         if (::anrWatchdog.isInitialized) {
             anrWatchdog.stopWatchdog()
-        }
-
-        // Unregister screen state receiver
-        if (::screenStateReceiver.isInitialized) {
-            try {
-                appContext?.unregisterReceiver(screenStateReceiver)
-                screenStateReceiver.cleanup()
-                android.util.Log.i("EnhancedCrashReporter", "✅ Screen state receiver unregistered")
-            } catch (e: Exception) {
-                android.util.Log.w("EnhancedCrashReporter", "Error unregistering screen state receiver: ${e.message}")
-            }
         }
 
         reachabilityTracker?.stopTracking()
