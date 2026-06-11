@@ -254,14 +254,23 @@ object CrashGrouping {
      */
     fun optimizePayload(crashData: CrashData): CrashData {
         return crashData.copy(
-            stackTrace = limitStackTrace(crashData.stackTrace),
+            stackTrace = limitStackTrace(crashData.stackTrace).let { st ->
+                // New Relic silently rejects events with any string attribute > 4096 bytes.
+                // Cap stack trace at 3985 chars to stay safely under the limit.
+                if (st.length > 3985) st.take(3970) + "\n... [truncated]" else st
+            },
             allThreads = limitThreads(crashData.allThreads, crashData.threadName),
             breadcrumbs = crashData.breadcrumbs.takeLast(MAX_BREADCRUMBS),
             memoryWarnings = crashData.memoryWarnings.takeLast(10),
             networkChanges = crashData.networkChanges.takeLast(10),
             customData = crashData.customData.entries.take(20).associate { it.key to scrubText(it.value) },
             exceptionMessage = scrubText(crashData.exceptionMessage),
-            memoryDump = crashData.memoryDump.take(1000)
+            memoryDump = crashData.memoryDump.take(1000),
+            // New Relic rejects attribute values > 4096 bytes — cap recentLogcat safely below that
+            recentLogcat = if (crashData.recentLogcat.length > 4000)
+                crashData.recentLogcat.take(3985) + " [truncated]"
+            else
+                crashData.recentLogcat
         )
     }
 

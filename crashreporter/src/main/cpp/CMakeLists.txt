@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(
     crashreporter-native
     SHARED
-    native_crash_handler.cpp
+    enhanced_native_crash_handler.cpp
 )
 
 # Find and link required libraries

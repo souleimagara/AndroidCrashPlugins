@@ -154,7 +154,9 @@ class EnhancedCrashHandler(
             responsibleSDKComponent = OperationTracker.determineResponsibleComponent(getDetailedStackTrace(throwable)),
             initFailurePoint = OperationTracker.getInitFailurePoint(),
             currentOperation = OperationTracker.getCurrentOperation() ?: "",
-            operationContext = OperationTracker.getOperationContext()
+            operationContext = OperationTracker.getOperationContext(),
+            sessionInfo = buildHandlerSessionInfo(),
+            memoryState = deviceInfoCollector.getMemoryState()
         )
 
         // Generate fingerprint and metadata
@@ -189,6 +191,18 @@ class EnhancedCrashHandler(
             android.util.Log.w("EnhancedCrashHandler", "Failed to capture logcat: ${e.message}")
             ""  // Return empty string if capture fails
         }
+    }
+
+    private fun buildHandlerSessionInfo(): SessionInfo {
+        val now = System.currentTimeMillis()
+        return SessionInfo(
+            sessionId = java.util.UUID.randomUUID().toString(),
+            sessionStartTime = now,
+            sessionDurationMs = 0L,
+            isInForeground = deviceInfoCollector.isInForeground(),
+            eventsBeforeCrash = BreadcrumbManager.getBreadcrumbs().size,
+            appWasInBackground = !deviceInfoCollector.isInForeground()
+        )
     }
 
     private fun getDetailedStackTrace(throwable: Throwable): String {

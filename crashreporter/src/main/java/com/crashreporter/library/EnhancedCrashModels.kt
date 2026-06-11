@@ -76,7 +76,11 @@ data class CrashData(
     val responsibleSDKComponent: String = "",       // Which SDK component caused crash (e.g., "ZBDUserController", "ZBDCrashReporter")
     val initFailurePoint: String = "",              // Where in SDK init the crash occurred (if applicable)
     val currentOperation: String = "",              // What SDK operation was running when crash happened
-    val operationContext: Map<String, String> = emptyMap() // Additional context about the operation
+    val operationContext: Map<String, String> = emptyMap(), // Additional context about the operation
+
+    // NEW FIELDS - iOS Parity (Session & Memory)
+    val sessionInfo: SessionInfo? = null,           // Session tracking for dashboards
+    val memoryState: MemoryState? = null            // Detailed memory breakdown (iOS parity)
 )
 
 data class DeviceInfo(
@@ -176,4 +180,22 @@ data class DiskPerformance(
     val readSpeedMBps: Double,
     val writeSpeedMBps: Double,
     val testTimestamp: Long
+)
+
+data class SessionInfo(
+    val sessionId: String,
+    val sessionStartTime: Long,    // When app was opened (ms since epoch)
+    val sessionDurationMs: Long,   // How long app has been open (ms)
+    val isInForeground: Boolean,   // Was app active/foreground when crash occurred?
+    val eventsBeforeCrash: Int,    // Number of breadcrumbs/events before crash
+    val appWasInBackground: Boolean
+)
+
+data class MemoryState(
+    val usedMemoryMB: Long,
+    val freeMemoryMB: Long,
+    val activeMemoryMB: Long,      // Active pages (recently used)
+    val inactiveMemoryMB: Long,    // Inactive pages (can be reclaimed)
+    val cachedMemoryMB: Long,      // Cached (buffers + cache from /proc/meminfo)
+    val totalMemoryMB: Long
 )

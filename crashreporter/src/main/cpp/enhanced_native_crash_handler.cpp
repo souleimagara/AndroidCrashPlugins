@@ -456,17 +456,47 @@ Java_com_crashreporter_library_NativeCrashHandler_initialize(JNIEnv* env, jobjec
     LOGI("Enhanced native crash handler initialized successfully");
 }
 
-// Test crash trigger (unchanged)
+// Re-install all signal handlers — call before triggering a test crash in case Unity
+// reinstalled its own handlers (e.g. via a dedicated signal-watching thread) after ours.
+static void reinstall_signal_handlers() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    // Re-register without saving old handler — g_old_handlers still holds
+    // Unity's original handlers captured at init time.
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGFPE,  &sa, nullptr);
+    sigaction(SIGILL,  &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+    sigaction(SIGTRAP, &sa, nullptr);
+
+    LOGI("Signal handlers re-registered for crash test");
+}
+
+// Test crash trigger
 extern "C" JNIEXPORT void JNICALL
 Java_com_crashreporter_library_NativeCrashHandler_triggerNativeCrash(JNIEnv* env, jobject /* this */, jint type) {
-    LOGD("Triggering native crash type: %d", type);
+    LOGI("Triggering native crash type: %d", type);
+
+    // Re-install our handlers before triggering.
+    // kill(getpid(), SIG) sends an asynchronous signal that Unity's sigwait thread may
+    // intercept first. A hardware fault (null deref) is synchronous — the kernel delivers
+    // it to THIS thread and our sa_sigaction MUST run. Re-registering here ensures our
+    // handler is the one installed even if Unity replaced it after initialisation.
+    if (g_initialized) {
+        reinstall_signal_handlers();
+    }
 
     switch (type) {
-        case 0: *((volatile int*)nullptr) = 42; break;
-        case 1: abort(); break;
-        case 2: { volatile int zero = 0; volatile int result = 42 / zero; (void)result; } break;
-        case 3: { volatile char* bad_ptr = (char*)0xDEADBEEF; *bad_ptr = 'x'; } break;
-        case 4: Java_com_crashreporter_library_NativeCrashHandler_triggerNativeCrash(env, nullptr, 4); break;
+        case 0: *((volatile int*)nullptr) = 42; break;  // SIGSEGV — real null ptr deref
+        case 1: abort(); break;                          // SIGABRT
+        case 2: { volatile int zero = 0; volatile int result = 42 / zero; (void)result; } break; // SIGFPE
+        case 3: { volatile char* bad_ptr = (char*)0xDEADBEEF; *bad_ptr = 'x'; } break;          // SIGSEGV bad ptr
+        case 4: Java_com_crashreporter_library_NativeCrashHandler_triggerNativeCrash(env, nullptr, 4); break; // stack overflow
         default: LOGE("Unknown crash type: %d", type); break;
     }
 }

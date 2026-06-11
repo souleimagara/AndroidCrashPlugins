@@ -552,6 +552,66 @@ class EnhancedDeviceInfoCollector(private val context: Context) {
     }
 
     /**
+     * Check if app is currently in foreground
+     */
+    fun isInForeground(): Boolean {
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val processId = android.os.Process.myPid()
+            val runningProcesses = activityManager.runningAppProcesses
+            val currentProcess = runningProcesses?.find { it.pid == processId }
+            currentProcess?.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Get detailed memory state from /proc/meminfo (iOS vm_statistics64 parity)
+     */
+    fun getMemoryState(): MemoryState {
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memInfo)
+
+            val totalMB = memInfo.totalMem / (1024 * 1024)
+            val availMB = memInfo.availMem / (1024 * 1024)
+            val usedMB = totalMB - availMB
+
+            // Parse /proc/meminfo for detailed breakdown
+            var activeMB = 0L
+            var inactiveMB = 0L
+            var cachedMB = 0L
+
+            try {
+                java.io.File("/proc/meminfo").forEachLine { line ->
+                    val parts = line.split(":").map { it.trim() }
+                    if (parts.size == 2) {
+                        val kb = parts[1].replace(" kB", "").trim().toLongOrNull() ?: 0L
+                        when (parts[0]) {
+                            "Active"   -> activeMB   = kb / 1024
+                            "Inactive" -> inactiveMB = kb / 1024
+                            "Cached"   -> cachedMB   = kb / 1024
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+
+            MemoryState(
+                usedMemoryMB    = usedMB,
+                freeMemoryMB    = availMB,
+                activeMemoryMB  = activeMB,
+                inactiveMemoryMB= inactiveMB,
+                cachedMemoryMB  = cachedMB,
+                totalMemoryMB   = totalMB
+            )
+        } catch (e: Exception) {
+            MemoryState(0L, 0L, 0L, 0L, 0L, 0L)
+        }
+    }
+
+    /**
      * Get memory pressure level
      */
     fun getMemoryPressure(): String {

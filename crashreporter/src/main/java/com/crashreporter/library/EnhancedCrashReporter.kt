@@ -31,6 +31,8 @@ object EnhancedCrashReporter {
     private var ANR_THRESHOLD_MS = 60000L
 
     private var isInitialized = false
+    private var sessionId: String = java.util.UUID.randomUUID().toString()
+    private var sessionStartTime: Long = 0L
     private lateinit var crashHandler: EnhancedCrashHandler
     private lateinit var crashStorage: CrashStorageProvider
     private lateinit var crashSender: EnhancedCrashSender
@@ -47,20 +49,21 @@ object EnhancedCrashReporter {
      * Initialize the enhanced crash reporter
      */
     @JvmStatic
-    fun initialize(context: Context, apiEndpoint: String, enableANRDetection: Boolean = true) {
+    fun initialize(context: Context, apiEndpoint: String, enableANRDetection: Boolean = true, apiKey: String = "", debugWebhookUrl: String = "") {
         if (isInitialized) {
             android.util.Log.w("EnhancedCrashReporter", "Already initialized, skipping...")
             return
         }
 
         try {
+            appContext = context.applicationContext
             val appContext = context.applicationContext
 
             android.util.Log.i("EnhancedCrashReporter", "🚀 Initializing Enhanced Crash Reporter v2.0")
 
             // Initialize components
             crashStorage = FileCrashStorage(appContext)
-            crashSender = EnhancedCrashSender(apiEndpoint, crashStorage)
+            crashSender = EnhancedCrashSender(apiEndpoint, crashStorage, apiKey = apiKey, debugWebhookUrl = debugWebhookUrl)
             deviceInfoCollector = EnhancedDeviceInfoCollector(appContext)
             startupCrashDetector = StartupCrashDetector(appContext)
 
@@ -81,6 +84,9 @@ object EnhancedCrashReporter {
                 android.util.Log.e("EnhancedCrashReporter", "🔴 CRASH LOOP DETECTED! ${startupInfo.startupCrashCount} crashes")
                 // You could disable features or show a safe mode UI here
             }
+
+            // Record session start time
+            sessionStartTime = System.currentTimeMillis()
 
             // Mark app as started
             startupCrashDetector.markAppStarted()
@@ -310,7 +316,9 @@ object EnhancedCrashReporter {
                 responsibleSDKComponent = OperationTracker.determineResponsibleComponent(anrInfo.mainThreadStackTrace),
                 initFailurePoint = OperationTracker.getInitFailurePoint(),
                 currentOperation = OperationTracker.getCurrentOperation() ?: "",
-                operationContext = OperationTracker.getOperationContext()
+                operationContext = OperationTracker.getOperationContext(),
+                sessionInfo = buildSessionInfo(inForeground = deviceInfoCollector.isInForeground()),
+                memoryState = deviceInfoCollector.getMemoryState()
             )
 
             // Generate fingerprint
@@ -409,12 +417,16 @@ object EnhancedCrashReporter {
 
                     crashStorage.saveCrash(crashData)
 
-                    val success = crashSender.processCrash(crashData)
+                    // Bypass dedup — send directly. Fingerprint must not block native crashes
+                    // that were saved but never successfully delivered.
+                    android.util.Log.i("EnhancedCrashReporter", "📡 HTTP POST → New Relic (native crash): ${crashData.crashId}")
+                    val optimized = CrashGrouping.optimizePayload(crashData)
+                    val success = crashSender.sendCrash(optimized)
                     if (success) {
-                        android.util.Log.i("EnhancedCrashReporter", "✅ Native crash processed successfully")
+                        android.util.Log.i("EnhancedCrashReporter", "✅ Native crash sent successfully")
                         NativeCrashHandler.deleteNativeCrashFile()
                     } else {
-                        android.util.Log.w("EnhancedCrashReporter", "⚠️ Failed to process native crash, will retry later")
+                        android.util.Log.w("EnhancedCrashReporter", "⚠️ Failed to send native crash, will retry next launch")
                     }
                 }
             } catch (e: Exception) {
@@ -477,6 +489,10 @@ object EnhancedCrashReporter {
             ?: OperationTracker.getSDKVersion()
         val restoredInitFailurePoint = persistedCtx?.optString("initFailurePoint")?.takeIf { it.isNotEmpty() }
             ?: OperationTracker.getInitFailurePoint()
+        // Restore the environment saved before the crash. Without this, CustomDataManager
+        // on fresh process defaults to "staging", making all native crashes show wrong env.
+        val restoredEnvironment = persistedCtx?.optString("environment")?.takeIf { it.isNotEmpty() }
+            ?: CustomDataManager.getEnvironment()
 
         if (persistedCtx != null) {
             android.util.Log.i("EnhancedCrashReporter", "✅ Restored SDK context from disk for native crash report")
@@ -513,7 +529,7 @@ object EnhancedCrashReporter {
             allThreads = emptyList(),
             breadcrumbs = BreadcrumbManager.getBreadcrumbs(),
             customData = customDataWithOperations,
-            environment = CustomDataManager.getEnvironment(),
+            environment = restoredEnvironment,
             crashFingerprint = "",
             issueTitle = "",
             severity = "",
@@ -550,7 +566,9 @@ object EnhancedCrashReporter {
             responsibleSDKComponent = OperationTracker.determineResponsibleComponent(stackTrace),
             initFailurePoint = restoredInitFailurePoint,
             currentOperation = restoredCurrentOp ?: "",
-            operationContext = OperationTracker.getOperationContext()
+            operationContext = OperationTracker.getOperationContext(),
+            sessionInfo = buildSessionInfo(inForeground = false),
+            memoryState = deviceInfoCollector.getMemoryState()
         )
 
         // Generate fingerprint
@@ -610,8 +628,21 @@ object EnhancedCrashReporter {
         errorMessage: String,
         stackTrace: String,
         isFatal: Boolean,
-        customData: Map<String, String>
+        customDataJson: String
     ) {
+        // Parse the flat JSON string from the Unity C# bridge into a map.
+        // Accepting a string instead of Map<String,String> avoids allocating a Java HashMap
+        // and multiple JNI put() calls on the main thread inside the Unity exception handler.
+        val customData: Map<String, String> = try {
+            val json = org.json.JSONObject(customDataJson)
+            val map = mutableMapOf<String, String>()
+            json.keys().forEach { key -> map[key] = json.optString(key, "") }
+            map
+        } catch (e: Exception) {
+            android.util.Log.w("EnhancedCrashReporter", "Failed to parse customDataJson: ${e.message}")
+            emptyMap()
+        }
+
         try {
             // 📱 DIAGNOSTIC: Log method entry
             android.util.Log.i("EnhancedCrashReporter", "📱 handleManagedException ENTRY: type=$exceptionType, fatal=$isFatal, customDataSize=${customData.size}")
@@ -643,11 +674,24 @@ object EnhancedCrashReporter {
             // 📱 DIAGNOSTIC: Log device data collection start
             android.util.Log.d("EnhancedCrashReporter", "📱 Starting device data collection for managed exception...")
 
+            // If C# passed a generic Unity LogType ("Exception", "Error", "Assert") instead of the
+            // real class name, extract it from the start of errorMessage.
+            // Format: "NullReferenceException: Some message" → "NullReferenceException"
+            val resolvedExceptionType = if (exceptionType in listOf("Exception", "Error", "Assert", "Warning", "Log")) {
+                val candidate = errorMessage.substringBefore(":").trim()
+                if (candidate.isNotEmpty() && candidate.length < 80 && !candidate.contains(" "))
+                    candidate
+                else
+                    exceptionType
+            } else {
+                exceptionType
+            }
+
             // Collect all device data
             val crashData = CrashData(
                 crashId = java.util.UUID.randomUUID().toString(),
                 timestamp = System.currentTimeMillis(),
-                exceptionType = exceptionType,
+                exceptionType = resolvedExceptionType,
                 exceptionMessage = errorMessage,
                 stackTrace = stackTrace,
                 threadName = "main",
@@ -695,7 +739,9 @@ object EnhancedCrashReporter {
                 responsibleSDKComponent = OperationTracker.determineResponsibleComponent(stackTrace),
                 initFailurePoint = OperationTracker.getInitFailurePoint(),
                 currentOperation = OperationTracker.getCurrentOperation() ?: "",
-                operationContext = OperationTracker.getOperationContext()
+                operationContext = OperationTracker.getOperationContext(),
+                sessionInfo = buildSessionInfo(inForeground = deviceInfoCollector.isInForeground()),
+                memoryState = deviceInfoCollector.getMemoryState()
             )
 
             // 📱 DIAGNOSTIC: Log device data collected
@@ -796,6 +842,9 @@ object EnhancedCrashReporter {
                 put("sdkVersion", OperationTracker.getSDKVersion())
                 put("initFailurePoint", OperationTracker.getInitFailurePoint())
                 put("timestamp", System.currentTimeMillis())
+                // Persist environment — CustomDataManager defaults to "staging" on fresh process,
+                // so we must save the real value here so native crash reports show the correct env.
+                put("environment", CustomDataManager.getEnvironment())
 
                 // Custom tags from SDK (includes init stages, user IDs, webview state etc.
                 // pushed by ZBDAndroidCrashBridge.SendSDKContextToNative)
@@ -825,6 +874,22 @@ object EnhancedCrashReporter {
             android.util.Log.w("EnhancedCrashReporter", "Failed to load persisted context: ${e.message}")
             null
         }
+    }
+
+    /**
+     * Build a SessionInfo snapshot for the current session
+     */
+    private fun buildSessionInfo(inForeground: Boolean = true): SessionInfo {
+        val now = System.currentTimeMillis()
+        val start = if (sessionStartTime > 0L) sessionStartTime else now
+        return SessionInfo(
+            sessionId = sessionId,
+            sessionStartTime = start,
+            sessionDurationMs = now - start,
+            isInForeground = inForeground,
+            eventsBeforeCrash = BreadcrumbManager.getBreadcrumbs().size,
+            appWasInBackground = !inForeground
+        )
     }
 
     /**

@@ -219,6 +219,13 @@ object OperationTracker {
      */
     @JvmStatic
     fun isSDKRelatedCrash(stackTrace: String): Boolean {
+        // If an SDK operation was active at crash time, it's SDK-related.
+        // Stack trace patterns alone don't work for IL2CPP release builds
+        // since C# class names are stripped from the native stack trace.
+        if (!getCurrentOperation().isNullOrEmpty()) return true
+        if (!getLastFailedOperation().isNullOrEmpty()) return true
+
+        // Fallback: check stack trace patterns (works for JVM/debug builds)
         val sdkPatterns = listOf(
             "com.zbd.",
             "ZBD",
@@ -238,7 +245,8 @@ object OperationTracker {
      */
     @JvmStatic
     fun determineResponsibleComponent(stackTrace: String): String {
-        return when {
+        // First try to identify component from stack trace (works for JVM/debug builds)
+        val fromStack = when {
             stackTrace.contains("ZBDUserController", ignoreCase = true) -> "ZBDUserController"
             stackTrace.contains("ZBDSignUpController", ignoreCase = true) -> "ZBDSignUpController"
             stackTrace.contains("ZBDSendRewardController", ignoreCase = true) -> "ZBDSendRewardController"
@@ -248,5 +256,10 @@ object OperationTracker {
             stackTrace.contains("ZBD", ignoreCase = true) -> "ZBD_Unknown"
             else -> ""
         }
+        if (fromStack.isNotEmpty()) return fromStack
+
+        // Fallback for IL2CPP builds: use active operation name as the component
+        val op = getCurrentOperation() ?: getLastFailedOperation()
+        return if (!op.isNullOrEmpty()) "SDK_$op" else ""
     }
 }

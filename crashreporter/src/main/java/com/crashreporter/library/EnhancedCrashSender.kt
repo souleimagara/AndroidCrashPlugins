@@ -23,7 +23,9 @@ import kotlin.math.pow
 class EnhancedCrashSender(
     private val apiEndpoint: String,
     private val crashStorage: CrashStorageProvider,
-    private val networkProvider: NetworkProvider = OkHttpNetworkProvider()
+    private val networkProvider: NetworkProvider = OkHttpNetworkProvider(),
+    private val apiKey: String = "",
+    private val debugWebhookUrl: String = ""   // Optional secondary endpoint (e.g. webhook.site) for payload inspection
 ) {
 
     private val gson: Gson = GsonBuilder()
@@ -58,6 +60,8 @@ class EnhancedCrashSender(
             is SendDecision.IncrementOnly -> {
                 android.util.Log.d("EnhancedCrashSender", "🔢 Duplicate #${decision.count}: ${decision.fingerprint}")
                 sendCounterUpdate(decision.fingerprint, decision.count)
+                // Mark as sent so it is removed from pending storage and doesn't loop forever
+                crashStorage.markAsSent(crashData.crashId)
                 return@withContext true
             }
             is SendDecision.AddToBatch -> {
@@ -88,8 +92,28 @@ class EnhancedCrashSender(
 
             when (val result = networkProvider.post(url, payload, headers)) {
                 is NetworkResult.Success -> {
-                    android.util.Log.i("EnhancedCrashSender", "✅ Crash sent successfully: ${crashData.crashId}")
+                    // Log the NR response body to detect silent rejections (NR returns HTTP 200
+                    // even when it rejects an event — the body contains {"success":true/false})
+                    val nrBody = result.body
+                    if (nrBody.contains("\"success\":false") || nrBody.contains("\"success\": false")) {
+                        android.util.Log.e("EnhancedCrashSender", "❌ NR accepted POST but rejected event! Body: $nrBody | crashId: ${crashData.crashId}")
+                    } else {
+                        android.util.Log.i("EnhancedCrashSender", "✅ Crash sent successfully: ${crashData.crashId} | NR: $nrBody")
+                    }
                     crashStorage.markAsSent(crashData.crashId)
+                    // Mirror to debug webhook if configured (best-effort, no retry)
+                    if (debugWebhookUrl.isNotEmpty() && debugWebhookUrl != "https://webhook.site/YOUR-TOKEN-HERE") {
+                        try {
+                            val (_, debugPayload, debugHeaders) = prepareRequest(optimized)
+                            val debugResult = networkProvider.post(debugWebhookUrl, debugPayload, debugHeaders)
+                            when (debugResult) {
+                                is NetworkResult.Success -> android.util.Log.i("EnhancedCrashSender", "🔗 Debug webhook: sent OK → $debugWebhookUrl")
+                                is NetworkResult.Failure -> android.util.Log.w("EnhancedCrashSender", "🔗 Debug webhook: failed (${debugResult.error}) — NR send was OK")
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.w("EnhancedCrashSender", "🔗 Debug webhook error (ignored): ${e.message}")
+                        }
+                    }
                     true
                 }
                 is NetworkResult.Failure -> {
@@ -115,16 +139,94 @@ class EnhancedCrashSender(
      * Prepare request (uncompressed JSON)
      */
     private fun prepareRequest(crashData: CrashData): Triple<String, String, Map<String, String>> {
-        val url = if (apiEndpoint.endsWith("/")) "${apiEndpoint}api/crashes" else "$apiEndpoint/api/crashes"
-        val json = gson.toJson(crashData)
+        // Use the endpoint URL directly — New Relic provides the full ingest URL
+        val url = apiEndpoint
 
-        val headers = mapOf(
+        // New Relic Events API requires a JSON array with an eventType field.
+        // IMPORTANT: New Relic silently drops nested JSON objects — all nested fields
+        // (deviceInfo, appInfo, deviceState, etc.) must be flattened to top-level primitives.
+        val crashJsonObject = gson.toJsonTree(crashData).asJsonObject
+        crashJsonObject.addProperty("eventType", "ZBDCrashReport")
+        crashJsonObject.addProperty("gameId", crashData.appInfo.packageName)
+
+        // Flatten deviceInfo — New Relic drops the nested object without this
+        crashJsonObject.addProperty("deviceModel", crashData.deviceInfo.model)
+        crashJsonObject.addProperty("deviceManufacturer", crashData.deviceInfo.manufacturer)
+        crashJsonObject.addProperty("androidVersion", crashData.deviceInfo.androidVersion)
+        crashJsonObject.addProperty("deviceApiLevel", crashData.deviceInfo.apiLevel)
+        crashJsonObject.addProperty("deviceBrand", crashData.deviceInfo.brand)
+        crashJsonObject.addProperty("screenWidth", crashData.deviceInfo.screenWidth)
+        crashJsonObject.addProperty("screenHeight", crashData.deviceInfo.screenHeight)
+        crashJsonObject.remove("deviceInfo")
+
+        // Flatten appInfo
+        crashJsonObject.addProperty("appVersion", crashData.appInfo.versionName)
+        crashJsonObject.addProperty("appPackageName", crashData.appInfo.packageName)
+        crashJsonObject.addProperty("appVersionCode", crashData.appInfo.versionCode)
+        crashJsonObject.remove("appInfo")
+
+        // Flatten deviceState
+        crashJsonObject.addProperty("batteryLevel", crashData.deviceState.batteryLevel)
+        crashJsonObject.addProperty("isCharging", crashData.deviceState.isCharging)
+        crashJsonObject.addProperty("availableMemoryMB", crashData.deviceState.availableMemoryMB)
+        crashJsonObject.addProperty("totalMemoryMB", crashData.deviceState.totalMemoryMB)
+        crashJsonObject.addProperty("lowMemory", crashData.deviceState.lowMemory)
+        crashJsonObject.addProperty("orientation", crashData.deviceState.orientation)
+        crashJsonObject.remove("deviceState")
+
+        // Flatten networkInfo
+        crashJsonObject.addProperty("networkConnected", crashData.networkInfo.isConnected)
+        crashJsonObject.addProperty("networkType", crashData.networkInfo.connectionType)
+        crashJsonObject.remove("networkInfo")
+
+        // Flatten memoryInfo
+        crashJsonObject.addProperty("heapSizeKB", crashData.memoryInfo.heapSizeKB)
+        crashJsonObject.addProperty("heapFreeKB", crashData.memoryInfo.heapFreeKB)
+        crashJsonObject.remove("memoryInfo")
+
+        // Flatten cpuInfo
+        crashJsonObject.addProperty("cpuCores", crashData.cpuInfo.coreCount)
+        crashJsonObject.addProperty("cpuArchitecture", crashData.cpuInfo.architecture)
+        crashJsonObject.remove("cpuInfo")
+
+        // Flatten processInfo
+        crashJsonObject.addProperty("processName", crashData.processInfo.processName)
+        crashJsonObject.addProperty("processForeground", crashData.processInfo.foreground)
+        crashJsonObject.remove("processInfo")
+
+        // Flatten customData map (key operation fields to top level)
+        crashData.customData["currentOperation"]?.let { crashJsonObject.addProperty("currentOperation", it) }
+        crashData.customData["lastSuccessfulOperation"]?.let { crashJsonObject.addProperty("lastSuccessfulOperation", it) }
+        crashData.customData["lastFailedOperation"]?.let { crashJsonObject.addProperty("lastFailedOperation", it) }
+        crashData.customData["lastOperationError"]?.let { crashJsonObject.addProperty("lastOperationError", it) }
+
+        // Remove unsupported types (arrays and nested objects New Relic cannot store)
+        crashJsonObject.remove("allThreads")
+        crashJsonObject.remove("breadcrumbs")
+        crashJsonObject.remove("memoryWarnings")
+        crashJsonObject.remove("networkChanges")
+        crashJsonObject.remove("nativeRegisters")
+        crashJsonObject.remove("operationContext")
+        crashJsonObject.remove("sdCardInfo")
+        crashJsonObject.remove("diskPerformance")
+        crashJsonObject.remove("sessionInfo")
+        crashJsonObject.remove("memoryState")
+        crashJsonObject.remove("customData")
+
+        val jsonArray = com.google.gson.JsonArray()
+        jsonArray.add(crashJsonObject)
+        val json = gson.toJson(jsonArray)
+
+        val headersMap = mutableMapOf(
             "Content-Type" to "application/json",
             "User-Agent" to "CrashReporter-Android/2.0",
             "X-Crash-Fingerprint" to crashData.crashFingerprint,
             "X-Crash-Severity" to crashData.severity
         )
-        return Triple(url, json, headers)
+        if (apiKey.isNotEmpty()) {
+            headersMap["Api-Key"] = apiKey
+        }
+        return Triple(url, json, headersMap)
     }
 
     /**
@@ -210,11 +312,16 @@ class EnhancedCrashSender(
                     val crashData = crashStorage.loadCrash(crashId)
 
                     if (crashData != null) {
-                        // CRITICAL: Use processCrash() instead of sendCrash() to enable deduplication
-                        // This ensures crashes loaded from disk go through the same dedup logic as fresh crashes
-                        val success = processCrash(crashData)
-                        if (!success) {
-                            android.util.Log.w("EnhancedCrashSender", "Failed to process crash: $crashId (will retry later)")
+                        // Crashes loaded from disk bypass deduplication — they were already saved
+                        // because a previous send attempt failed. Dedup caused them to be stuck
+                        // forever (fingerprint marked "reported" before send, so every retry = IncrementOnly).
+                        android.util.Log.i("EnhancedCrashSender", "📡 HTTP POST → New Relic: ${crashData.crashId}")
+                        val optimized = CrashGrouping.optimizePayload(crashData)
+                        val success = sendCrash(optimized)
+                        if (success) {
+                            android.util.Log.i("EnhancedCrashSender", "✅ Crash sent successfully: $crashId")
+                        } else {
+                            android.util.Log.w("EnhancedCrashSender", "❌ Failed to send crash: $crashId (will retry next launch)")
                         }
                     } else {
                         android.util.Log.w("EnhancedCrashSender", "Failed to load crash from ${file.name}")
