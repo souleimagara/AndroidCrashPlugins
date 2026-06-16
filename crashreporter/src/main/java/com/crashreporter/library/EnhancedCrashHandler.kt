@@ -55,13 +55,17 @@ class EnhancedCrashHandler(
                 }
             }
 
-            // Try to process immediately with deduplication (non-blocking, best effort)
-            runBlocking {
-                try {
-                    crashSender.processCrash(crashData)
-                } catch (e: Exception) {
-                    android.util.Log.d("EnhancedCrashHandler", "Failed to process crash immediately: ${e.message}")
-                    // OK if fails, will be processed on next app launch
+            // Try to process immediately with deduplication (non-blocking, best effort).
+            // Skipped when the host drives the signed send — the crash is already on disk and
+            // will be pulled, signed and sent by Unity C# on the next launch.
+            if (!EnhancedCrashReporter.isDeferSendToHost()) {
+                runBlocking {
+                    try {
+                        crashSender.processCrash(crashData)
+                    } catch (e: Exception) {
+                        android.util.Log.d("EnhancedCrashHandler", "Failed to process crash immediately: ${e.message}")
+                        // OK if fails, will be processed on next app launch
+                    }
                 }
             }
 

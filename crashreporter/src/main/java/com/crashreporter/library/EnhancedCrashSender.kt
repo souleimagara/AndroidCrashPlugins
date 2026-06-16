@@ -136,15 +136,15 @@ class EnhancedCrashSender(
     }
 
     /**
-     * Prepare request (uncompressed JSON)
+     * Build the flattened crash payload as a single JSON object.
+     * Public so the host layer (Unity C#) can pull the EXACT same payload it would otherwise
+     * POST — then sign it and send it itself (events.zbd.lol + NR + webhook). Pass an already
+     * optimized CrashData (callers below optimize before calling).
+     *
+     * New Relic Events API requires flat top-level primitives — all nested objects
+     * (deviceInfo, appInfo, deviceState, etc.) are flattened here and arrays removed.
      */
-    private fun prepareRequest(crashData: CrashData): Triple<String, String, Map<String, String>> {
-        // Use the endpoint URL directly — New Relic provides the full ingest URL
-        val url = apiEndpoint
-
-        // New Relic Events API requires a JSON array with an eventType field.
-        // IMPORTANT: New Relic silently drops nested JSON objects — all nested fields
-        // (deviceInfo, appInfo, deviceState, etc.) must be flattened to top-level primitives.
+    fun buildPayloadObject(crashData: CrashData): com.google.gson.JsonObject {
         val crashJsonObject = gson.toJsonTree(crashData).asJsonObject
         crashJsonObject.addProperty("eventType", "ZBDCrashReport")
         crashJsonObject.addProperty("gameId", crashData.appInfo.packageName)
@@ -213,8 +213,20 @@ class EnhancedCrashSender(
         crashJsonObject.remove("memoryState")
         crashJsonObject.remove("customData")
 
+        return crashJsonObject
+    }
+
+    /** Single-crash payload as a JSON string — exactly what the host signs and sends. */
+    fun buildPayloadJson(crashData: CrashData): String = gson.toJson(buildPayloadObject(crashData))
+
+    /**
+     * Prepare request (uncompressed JSON) — wraps the flattened payload object in the
+     * single-element array New Relic's Events API expects.
+     */
+    private fun prepareRequest(crashData: CrashData): Triple<String, String, Map<String, String>> {
+        val url = apiEndpoint
         val jsonArray = com.google.gson.JsonArray()
-        jsonArray.add(crashJsonObject)
+        jsonArray.add(buildPayloadObject(crashData))
         val json = gson.toJson(jsonArray)
 
         val headersMap = mutableMapOf(

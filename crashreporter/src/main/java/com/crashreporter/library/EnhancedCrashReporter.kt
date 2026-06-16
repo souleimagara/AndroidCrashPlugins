@@ -43,6 +43,69 @@ object EnhancedCrashReporter {
     private var memoryWarningTracker: MemoryWarningTracker? = null
     private var reachabilityTracker: ReachabilityTracker? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // When true, native only STORES crashes — the host (Unity C#) pulls them via
+    // getPendingCrashesAsJson(), signs each with the attestation key, and sends them itself
+    // (events.zbd.lol + New Relic + webhook). Default false keeps the legacy native auto-send.
+    @Volatile
+    private var deferSendToHost = false
+
+    /** Host opts in to driving the send (sign + deliver) itself. Native then only stores. */
+    @JvmStatic
+    fun setDeferSendToHost(enabled: Boolean) {
+        deferSendToHost = enabled
+        android.util.Log.i("EnhancedCrashReporter", "deferSendToHost = $enabled (host drives signed send)")
+    }
+
+    @JvmStatic
+    fun isDeferSendToHost(): Boolean = deferSendToHost
+
+    /**
+     * Return all pending (stored, unsent) crashes as a JSON wrapper the host can parse:
+     *   {"crashes":[{"crashId":"<id>","json":"<flattened crash payload>"}, ...]}
+     * The "json" string is the EXACT payload the host signs (base64) and POSTs. The host
+     * calls markCrashAsSent(crashId) after a successful delivery.
+     */
+    @JvmStatic
+    fun getPendingCrashesAsJson(): String {
+        return try {
+            if (!::crashStorage.isInitialized || !::crashSender.isInitialized) return "{\"crashes\":[]}"
+            val gson = com.google.gson.GsonBuilder().disableHtmlEscaping().serializeNulls().create()
+            val arr = com.google.gson.JsonArray()
+            for (file in crashStorage.getPendingCrashFiles()) {
+                try {
+                    val crashId = file.nameWithoutExtension.removePrefix("crash_")
+                    val crashData = kotlinx.coroutines.runBlocking { crashStorage.loadCrash(crashId) } ?: continue
+                    val optimized = CrashGrouping.optimizePayload(crashData)
+                    val entry = com.google.gson.JsonObject()
+                    entry.addProperty("crashId", crashData.crashId)
+                    entry.addProperty("json", crashSender.buildPayloadJson(optimized))
+                    arr.add(entry)
+                } catch (e: Exception) {
+                    android.util.Log.e("EnhancedCrashReporter", "getPendingCrashesAsJson: error for ${file.name}", e)
+                }
+            }
+            val wrapper = com.google.gson.JsonObject()
+            wrapper.add("crashes", arr)
+            gson.toJson(wrapper)
+        } catch (e: Exception) {
+            android.util.Log.e("EnhancedCrashReporter", "getPendingCrashesAsJson failed", e)
+            "{\"crashes\":[]}"
+        }
+    }
+
+    /** Host confirms a crash was delivered — remove it from pending storage. */
+    @JvmStatic
+    fun markCrashAsSent(crashId: String) {
+        try {
+            if (::crashStorage.isInitialized) {
+                kotlinx.coroutines.runBlocking { crashStorage.markAsSent(crashId) }
+                android.util.Log.i("EnhancedCrashReporter", "Host marked crash as sent: $crashId")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("EnhancedCrashReporter", "markCrashAsSent failed for $crashId", e)
+        }
+    }
     private var appContext: Context? = null
 
     /**
@@ -350,13 +413,17 @@ object EnhancedCrashReporter {
             // PHASE 3: SEND asynchronously (defer to background coroutine)
             // This is less critical - can happen later or after app restart
             // ════════════════════════════════════════════════════════════
-            scope.launch {
-                try {
-                    crashSender.processCrash(updatedCrashData)
-                    android.util.Log.i("EnhancedCrashReporter", "✅ ANR report processed successfully")
-                } catch (e: Exception) {
-                    android.util.Log.e("EnhancedCrashReporter", "Error processing ANR crash (will retry on next session)", e)
-                    // Crash is already persisted, so this failure is not critical
+            if (deferSendToHost) {
+                android.util.Log.i("EnhancedCrashReporter", "⏸️ ANR stored — host will sign + send")
+            } else {
+                scope.launch {
+                    try {
+                        crashSender.processCrash(updatedCrashData)
+                        android.util.Log.i("EnhancedCrashReporter", "✅ ANR report processed successfully")
+                    } catch (e: Exception) {
+                        android.util.Log.e("EnhancedCrashReporter", "Error processing ANR crash (will retry on next session)", e)
+                        // Crash is already persisted, so this failure is not critical
+                    }
                 }
             }
 
@@ -369,6 +436,10 @@ object EnhancedCrashReporter {
      * Send all pending crashes
      */
     private fun sendPendingCrashes() {
+        if (deferSendToHost) {
+            android.util.Log.i("EnhancedCrashReporter", "⏸️ Pending crashes left for host to sign + send")
+            return
+        }
         scope.launch {
             try {
                 crashSender.sendAllPendingCrashes()
@@ -418,6 +489,15 @@ object EnhancedCrashReporter {
                     val crashData = parseNativeCrash(nativeCrashContent)
 
                     crashStorage.saveCrash(crashData)
+
+                    if (deferSendToHost) {
+                        // Native data is now a pending storage entry the host will pull, sign and
+                        // send. Delete the raw native_crash.txt so it isn't re-parsed into a
+                        // duplicate pending entry on the next launch.
+                        android.util.Log.i("EnhancedCrashReporter", "⏸️ Native crash stored — host will sign + send: ${crashData.crashId}")
+                        NativeCrashHandler.deleteNativeCrashFile()
+                        return@launch
+                    }
 
                     // Bypass dedup — send directly. Fingerprint must not block native crashes
                     // that were saved but never successfully delivered.
@@ -782,10 +862,14 @@ object EnhancedCrashReporter {
 
                     android.util.Log.i("EnhancedCrashReporter", "📱 Managed exception saved to disk")
 
-                    // Send to webhook with deduplication
-                    android.util.Log.d("EnhancedCrashReporter", "📱 Sending managed exception to webhook (with dedup)...")
-                    crashSender.processCrash(updatedCrashData)
-                    android.util.Log.i("EnhancedCrashReporter", "✅ Managed exception processed successfully")
+                    if (deferSendToHost) {
+                        android.util.Log.i("EnhancedCrashReporter", "⏸️ Managed exception stored — host will sign + send")
+                    } else {
+                        // Send to webhook with deduplication
+                        android.util.Log.d("EnhancedCrashReporter", "📱 Sending managed exception to webhook (with dedup)...")
+                        crashSender.processCrash(updatedCrashData)
+                        android.util.Log.i("EnhancedCrashReporter", "✅ Managed exception processed successfully")
+                    }
                 } catch (e: Exception) {
                     android.util.Log.e("EnhancedCrashReporter", "❌ Error handling managed exception (will retry later): ${e.message}", e)
                 }
