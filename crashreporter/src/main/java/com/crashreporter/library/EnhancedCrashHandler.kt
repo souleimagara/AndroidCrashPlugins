@@ -151,6 +151,8 @@ class EnhancedCrashHandler(
             crashReporterPluginVersion = OperationTracker.getCrashReporterPluginVersion(),
             platform = OperationTracker.getPlatform(),
             isSDKRelated = OperationTracker.isSDKRelatedCrash(getDetailedStackTrace(throwable)),
+            sdkConfidence = OperationTracker.getSDKConfidence(getDetailedStackTrace(throwable), OperationTracker.extractFaultingLibrary(getDetailedStackTrace(throwable))),
+            faultingLibrary = OperationTracker.extractFaultingLibrary(getDetailedStackTrace(throwable)),
             responsibleSDKComponent = OperationTracker.determineResponsibleComponent(getDetailedStackTrace(throwable)),
             initFailurePoint = OperationTracker.getInitFailurePoint(),
             currentOperation = OperationTracker.getCurrentOperation() ?: "",

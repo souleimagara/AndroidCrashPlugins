@@ -225,10 +225,13 @@ object OperationTracker {
         if (!getCurrentOperation().isNullOrEmpty()) return true
         if (!getLastFailedOperation().isNullOrEmpty()) return true
 
-        // Fallback: check stack trace patterns (works for JVM/debug builds)
+        // Fallback: check stack trace patterns (works for JVM/debug builds).
+        // NOTE: use "ZBD." (the C# namespace prefix), NOT bare "ZBD" — the app's package
+        // path (e.g. "com.zbdpay.sdkdemo") appears in every native stack and a bare "ZBD"
+        // would match "zbdpay", falsely flagging EVERY native crash as SDK-related.
         val sdkPatterns = listOf(
             "com.zbd.",
-            "ZBD",
+            "ZBD.",
             "ZBDSDK",
             "ZBDUserController",
             "ZBDSignUpController",
@@ -238,6 +241,83 @@ object OperationTracker {
             "crashreporter.library"
         )
         return sdkPatterns.any { stackTrace.contains(it, ignoreCase = true) }
+    }
+
+    /**
+     * Extract the faulting library (.so) from a native crash stack trace.
+     * Native frames look like: "#003 pc 0x... /data/.../libXXX.so (symbol+0x..)".
+     * Skips our own crash-handler frames and the libc trampoline frames to find the
+     * first frame that represents the actual faulting code.
+     * Returns "" for managed/ANR stacks (which have no native library frames).
+     */
+    @JvmStatic
+    fun extractFaultingLibrary(stackTrace: String): String {
+        // Signal/runtime plumbing sits on top of the stack during a crash — skip it all so
+        // we report the first *app* library where the crash actually originated
+        // (e.g. libil2cpp.so = managed C#, libunity.so = engine, or the game's own .so).
+        val skip = listOf(
+            "libcrashreporter-native.so",  // our own signal handler (always on the stack)
+            "libsigchain.so",              // ART signal-chain trampoline
+            "libart.so",                   // ART runtime / interpreter→JNI bridge
+            "libc.so",
+            "libc++.so",
+            "libc++_shared.so",
+            "libc++abi.so",
+            "libnativehelper.so",
+            "libdl.so"
+        )
+        stackTrace.split("\n").forEach { line ->
+            val trimmed = line.trim()
+            if (!trimmed.startsWith("#")) return@forEach
+            val soToken = trimmed.split(' ', '(', ')').firstOrNull { it.contains(".so") }
+                ?: return@forEach
+            val base = soToken.substringAfterLast('/')
+            if (skip.none { base.equals(it, ignoreCase = true) }) {
+                return base
+            }
+        }
+        return ""
+    }
+
+    /**
+     * Compute confidence that this crash was caused by ZBD SDK code.
+     *  - "high":   ZBD's own native library faulted, or a real ZBD symbol is present (debug/unstripped builds)
+     *  - "medium": a ZBD operation was ACTIVELY in-flight when the crash happened
+     *  - "low":    a ZBD operation had recently failed but already ended — weak/coincidental signal
+     *  - "none":   no ZBD signal — most likely game or engine code
+     *
+     * IMPORTANT: in IL2CPP release builds, ZBD C# code and the game's C# code share
+     * libil2cpp.so with stripped symbols, so "high" is NOT reachable for managed C#
+     * crashes on-device. Trustworthy ZBD-vs-game attribution for those needs backend
+     * symbolication. Treat medium/low as hints, not facts.
+     */
+    @JvmStatic
+    fun getSDKConfidence(stackTrace: String, faultingLibrary: String): String {
+        // HIGH — our own native library faulted (definitive)
+        if (faultingLibrary.equals("libcrashreporter-native.so", ignoreCase = true)) return "high"
+
+        // HIGH — a real ZBD symbol/class name is present (works on debug/unstripped builds)
+        val strongPatterns = listOf(
+            "com.zbd.",
+            "ZBD.",
+            "ZBDSDK",
+            "ZBDUserController",
+            "ZBDSignUpController",
+            "ZBDSendRewardController",
+            "ZBDCrashReporter",
+            "ZBDAndroidCrashBridge",
+            "crashreporter.library"
+        )
+        if (strongPatterns.any { stackTrace.contains(it, ignoreCase = true) }) return "high"
+
+        // MEDIUM — a ZBD operation was actively running (in-flight) at crash time
+        if (!getCurrentOperation().isNullOrEmpty()) return "medium"
+
+        // LOW — a ZBD operation had recently failed but already ended (timing coincidence)
+        if (!getLastFailedOperation().isNullOrEmpty()) return "low"
+
+        // NONE — no ZBD signal
+        return "none"
     }
 
     /**
@@ -253,7 +333,7 @@ object OperationTracker {
             stackTrace.contains("ZBDCrashReporter", ignoreCase = true) -> "ZBDCrashReporter"
             stackTrace.contains("ZBDAndroidCrashBridge", ignoreCase = true) -> "ZBDAndroidCrashBridge"
             stackTrace.contains("crashreporter.library", ignoreCase = true) -> "CrashReporterLibrary"
-            stackTrace.contains("ZBD", ignoreCase = true) -> "ZBD_Unknown"
+            stackTrace.contains("ZBD.", ignoreCase = true) -> "ZBD_Unknown"  // "ZBD." namespace, not bare "ZBD" (avoids matching "zbdpay" package path)
             else -> ""
         }
         if (fromStack.isNotEmpty()) return fromStack

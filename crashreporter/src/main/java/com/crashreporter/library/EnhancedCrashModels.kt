@@ -72,7 +72,9 @@ data class CrashData(
     val sdkVersion: String = "",                    // ZBD SDK version (e.g., "0.7.0")
     val crashReporterPluginVersion: String = "1.0.0", // Crash reporter plugin version
     val platform: String = "Android",               // Platform: Android, iOS, Unity
-    val isSDKRelated: Boolean = false,              // Is crash related to ZBD SDK code
+    val isSDKRelated: Boolean = false,              // Is crash related to ZBD SDK code (weak hint — see sdkConfidence)
+    val sdkConfidence: String = "none",             // Attribution confidence: high | medium | low | none
+    val faultingLibrary: String = "",               // Native .so where the crash occurred (e.g. "libil2cpp.so"); "" for managed/ANR
     val responsibleSDKComponent: String = "",       // Which SDK component caused crash (e.g., "ZBDUserController", "ZBDCrashReporter")
     val initFailurePoint: String = "",              // Where in SDK init the crash occurred (if applicable)
     val currentOperation: String = "",              // What SDK operation was running when crash happened
