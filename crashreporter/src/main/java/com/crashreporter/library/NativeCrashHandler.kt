@@ -17,7 +17,10 @@ object NativeCrashHandler {
         try {
             System.loadLibrary("crashreporter-native")
             android.util.Log.i("NativeCrashHandler", "Native library loaded successfully")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // loadLibrary throws UnsatisfiedLinkError (an Error, NOT an Exception) when the ABI /
+            // packaging omits the native lib — catch Throwable so a missing lib degrades gracefully
+            // instead of propagating and disabling managed-exception + ANR reporting all session.
             android.util.Log.e("NativeCrashHandler", "Failed to load native library", e)
         }
     }
@@ -42,7 +45,8 @@ object NativeCrashHandler {
             isNativeInitialized = true
 
             android.util.Log.i("NativeCrashHandler", "Native crash handler initialized")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // UnsatisfiedLinkError (Error, not Exception) if the native method isn't linked.
             android.util.Log.e("NativeCrashHandler", "Failed to initialize native crash handler", e)
         }
     }

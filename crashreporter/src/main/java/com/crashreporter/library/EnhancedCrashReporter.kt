@@ -126,7 +126,7 @@ object EnhancedCrashReporter {
 
             // Initialize components
             crashStorage = FileCrashStorage(appContext)
-            crashSender = EnhancedCrashSender(apiEndpoint, crashStorage, apiKey = apiKey, debugWebhookUrl = debugWebhookUrl)
+            crashSender = EnhancedCrashSender()
             deviceInfoCollector = EnhancedDeviceInfoCollector(appContext)
             startupCrashDetector = StartupCrashDetector(appContext)
 
@@ -176,7 +176,6 @@ object EnhancedCrashReporter {
             crashHandler = EnhancedCrashHandler(
                 context = appContext,
                 crashStorage = crashStorage,
-                crashSender = crashSender,
                 deviceInfoCollector = deviceInfoCollector,
                 startupCrashDetector = startupCrashDetector,
                 memoryWarningTracker = memoryWarningTracker,
@@ -195,11 +194,8 @@ object EnhancedCrashReporter {
                 android.util.Log.w("EnhancedCrashReporter", "Failed to initialize native crash handler: ${e.message}")
             }
 
-            // Process any pending native crashes from previous session
+            // Process any pending native crashes from previous session (store for host to send)
             processNativeCrash()
-
-            // Send any pending crashes from previous sessions
-            sendPendingCrashes()
 
             // Initialize ANR watchdog (optional)
             if (enableANRDetection) {
@@ -390,6 +386,13 @@ object EnhancedCrashReporter {
             val fingerprint = CrashGrouping.generateFingerprint(crashData)
             val updatedCrashData = crashData.copy(crashFingerprint = fingerprint)
 
+            // Deduplicate: a recurring identical ANR (same fingerprint) shouldn't be stored/sent
+            // over and over within the dedup window — collapse the repeats.
+            if (CrashGrouping.isRecentDuplicate(fingerprint)) {
+                android.util.Log.d("EnhancedCrashReporter", "⏭️ Duplicate ANR fingerprint ($fingerprint) — skipping store/send")
+                return
+            }
+
             // ════════════════════════════════════════════════════════════
             // PHASE 2: PERSIST immediately (synchronous, on watchdog thread)
             // This MUST happen before ANY async operations or coroutine launches
@@ -409,23 +412,8 @@ object EnhancedCrashReporter {
                 // The crash data is at least in memory for this session
             }
 
-            // ════════════════════════════════════════════════════════════
-            // PHASE 3: SEND asynchronously (defer to background coroutine)
-            // This is less critical - can happen later or after app restart
-            // ════════════════════════════════════════════════════════════
-            if (deferSendToHost) {
-                android.util.Log.i("EnhancedCrashReporter", "⏸️ ANR stored — host will sign + send")
-            } else {
-                scope.launch {
-                    try {
-                        crashSender.processCrash(updatedCrashData)
-                        android.util.Log.i("EnhancedCrashReporter", "✅ ANR report processed successfully")
-                    } catch (e: Exception) {
-                        android.util.Log.e("EnhancedCrashReporter", "Error processing ANR crash (will retry on next session)", e)
-                        // Crash is already persisted, so this failure is not critical
-                    }
-                }
-            }
+            // Stored to disk — the Unity host pulls, signs and sends it.
+            android.util.Log.i("EnhancedCrashReporter", "⏸️ ANR stored — host will sign + send")
 
         } catch (e: Exception) {
             android.util.Log.e("EnhancedCrashReporter", "Error handling ANR", e)
@@ -433,28 +421,13 @@ object EnhancedCrashReporter {
     }
 
     /**
-     * Send all pending crashes
-     */
-    private fun sendPendingCrashes() {
-        if (deferSendToHost) {
-            android.util.Log.i("EnhancedCrashReporter", "⏸️ Pending crashes left for host to sign + send")
-            return
-        }
-        scope.launch {
-            try {
-                crashSender.sendAllPendingCrashes()
-            } catch (e: Exception) {
-                android.util.Log.e("EnhancedCrashReporter", "Error sending pending crashes: ${e.message}", e)
-            }
-        }
-    }
-
-    /**
-     * Manually trigger sending pending crashes
+     * Pending crashes are stored on disk; the Unity host pulls, signs and sends them
+     * (getPendingCrashesAsJson → sign → POST). Native never sends, so this is a no-op kept
+     * for the host-facing API surface.
      */
     @JvmStatic
     fun sendPendingCrashesNow() {
-        sendPendingCrashes()
+        android.util.Log.i("EnhancedCrashReporter", "⏸️ Pending crashes left for host to sign + send")
     }
 
     /**
@@ -490,26 +463,11 @@ object EnhancedCrashReporter {
 
                     crashStorage.saveCrash(crashData)
 
-                    if (deferSendToHost) {
-                        // Native data is now a pending storage entry the host will pull, sign and
-                        // send. Delete the raw native_crash.txt so it isn't re-parsed into a
-                        // duplicate pending entry on the next launch.
-                        android.util.Log.i("EnhancedCrashReporter", "⏸️ Native crash stored — host will sign + send: ${crashData.crashId}")
-                        NativeCrashHandler.deleteNativeCrashFile()
-                        return@launch
-                    }
-
-                    // Bypass dedup — send directly. Fingerprint must not block native crashes
-                    // that were saved but never successfully delivered.
-                    android.util.Log.i("EnhancedCrashReporter", "📡 HTTP POST → New Relic (native crash): ${crashData.crashId}")
-                    val optimized = CrashGrouping.optimizePayload(crashData)
-                    val success = crashSender.sendCrash(optimized)
-                    if (success) {
-                        android.util.Log.i("EnhancedCrashReporter", "✅ Native crash sent successfully")
-                        NativeCrashHandler.deleteNativeCrashFile()
-                    } else {
-                        android.util.Log.w("EnhancedCrashReporter", "⚠️ Failed to send native crash, will retry next launch")
-                    }
+                    // Native data is now a pending storage entry the Unity host will pull, sign and
+                    // send. Delete the raw native_crash.txt so it isn't re-parsed into a duplicate
+                    // pending entry on the next launch.
+                    android.util.Log.i("EnhancedCrashReporter", "⏸️ Native crash stored — host will sign + send: ${crashData.crashId}")
+                    NativeCrashHandler.deleteNativeCrashFile()
                 }
             } catch (e: Exception) {
                 android.util.Log.e("EnhancedCrashReporter", "Error processing native crash: ${e.message}", e)
@@ -520,6 +478,17 @@ object EnhancedCrashReporter {
     /**
      * Parse enhanced native crash file
      */
+    /** Stable crashId from native crash content so a re-parse of the same file yields the same id. */
+    private fun deterministicNativeCrashId(signal: String, faultAddress: String, stack: String): String {
+        return try {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val hash = digest.digest("$signal|$faultAddress|$stack".toByteArray())
+            "native-" + hash.take(16).joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            UUID.randomUUID().toString()
+        }
+    }
+
     private fun parseNativeCrash(content: String): CrashData {
         val lines = content.split("\n")
         var signal = "UNKNOWN"
@@ -595,7 +564,10 @@ object EnhancedCrashReporter {
         customDataWithOperations["lastOperationError"] = restoredFailureReason ?: "none"
 
         val crashData = CrashData(
-            crashId = UUID.randomUUID().toString(),
+            // Deterministic id from the crash content (not a random UUID): if the process died
+            // between saving this crash and deleting native_crash.txt, the next launch re-parses the
+            // same file → same id → the backend collapses the duplicate instead of logging two.
+            crashId = deterministicNativeCrashId(signal, faultAddress, stackTrace.ifEmpty { content }),
             timestamp = System.currentTimeMillis(),
             exceptionType = signal,
             exceptionMessage = "$description at $faultAddress",
@@ -841,7 +813,11 @@ object EnhancedCrashReporter {
             // Generate fingerprint and metadata
             val fingerprint = CrashGrouping.generateFingerprint(crashData)
             val issueTitle = CrashGrouping.generateIssueTitle(crashData)
-            val severity = if (isFatal) "CRITICAL" else CrashGrouping.determineSeverity(crashData).name
+            // Only actually-fatal crashes are CRITICAL. Managed exceptions come in with isFatal=false
+            // and are HIGH (not CRITICAL) — matches iOS and keeps the fatal-crash SLO honest.
+            // (Don't use determineSeverity here: its main-thread rule would wrongly mark every
+            // managed main-thread exception CRITICAL.)
+            val severity = if (isFatal) "CRITICAL" else "HIGH"
 
             val updatedCrashData = crashData.copy(
                 crashFingerprint = fingerprint,
@@ -850,6 +826,13 @@ object EnhancedCrashReporter {
             )
 
             android.util.Log.i("EnhancedCrashReporter", "📱 Managed exception prepared: type=$exceptionType, severity=$severity, fingerprint=$fingerprint")
+
+            // Deduplicate: identical managed exceptions (same fingerprint) shouldn't be stored/sent
+            // repeatedly within the dedup window — collapse the repeats.
+            if (CrashGrouping.isRecentDuplicate(fingerprint)) {
+                android.util.Log.d("EnhancedCrashReporter", "⏭️ Duplicate managed exception fingerprint ($fingerprint) — skipping store/send")
+                return
+            }
 
             // Persist and send asynchronously
             scope.launch {
@@ -861,15 +844,7 @@ object EnhancedCrashReporter {
                     crashStorage.saveCrash(updatedCrashData)
 
                     android.util.Log.i("EnhancedCrashReporter", "📱 Managed exception saved to disk")
-
-                    if (deferSendToHost) {
-                        android.util.Log.i("EnhancedCrashReporter", "⏸️ Managed exception stored — host will sign + send")
-                    } else {
-                        // Send to webhook with deduplication
-                        android.util.Log.d("EnhancedCrashReporter", "📱 Sending managed exception to webhook (with dedup)...")
-                        crashSender.processCrash(updatedCrashData)
-                        android.util.Log.i("EnhancedCrashReporter", "✅ Managed exception processed successfully")
-                    }
+                    android.util.Log.i("EnhancedCrashReporter", "⏸️ Managed exception stored — host will sign + send")
                 } catch (e: Exception) {
                     android.util.Log.e("EnhancedCrashReporter", "❌ Error handling managed exception (will retry later): ${e.message}", e)
                 }
@@ -906,6 +881,10 @@ object EnhancedCrashReporter {
         return threads
     }
 
+    // Signature (content minus timestamp) of the last context written to disk, so the frequent
+    // periodic pushes don't rewrite identical data.
+    @Volatile private var lastPersistedContextSignature: String? = null
+
     /**
      * Persist current SDK context (OperationTracker + CustomDataManager) to disk so that
      * native signal crash recovery can read it on the next app launch.
@@ -917,11 +896,14 @@ object EnhancedCrashReporter {
      * we ensure the last known SDK state survives the crash and appears in the report.
      *
      * Called from Unity via JNI: ZBDAndroidCrashBridge.SendSDKContextToNative()
+     *
+     * Returns true only when it actually wrote to disk (false when skipped/unchanged or on error),
+     * so the host can log accurately instead of every tick.
      */
     @JvmStatic
-    fun persistContextForNativeCrashRecovery() {
+    fun persistContextForNativeCrashRecovery(): Boolean {
         try {
-            val ctx = appContext ?: return
+            val ctx = appContext ?: return false
             val contextFile = File(ctx.filesDir, "zbd_crash_context.json")
 
             val json = JSONObject().apply {
@@ -931,7 +913,6 @@ object EnhancedCrashReporter {
                 put("lastFailureReason", OperationTracker.getLastFailureReason() ?: "")
                 put("sdkVersion", OperationTracker.getSDKVersion())
                 put("initFailurePoint", OperationTracker.getInitFailurePoint())
-                put("timestamp", System.currentTimeMillis())
                 // Persist environment — CustomDataManager defaults to "staging" on fresh process,
                 // so we must save the real value here so native crash reports show the correct env.
                 put("environment", CustomDataManager.getEnvironment())
@@ -943,10 +924,20 @@ object EnhancedCrashReporter {
                 put("customData", customDataJson)
             }
 
+            // Skip the write when nothing changed — this runs on a frequent timer from the Unity
+            // bridge, and rewriting identical context is pointless disk I/O in the host game. The
+            // timestamp is added only when we actually write, so it doesn't defeat this check.
+            val signature = json.toString()
+            if (signature == lastPersistedContextSignature) return false
+            lastPersistedContextSignature = signature
+
+            json.put("timestamp", System.currentTimeMillis())
             contextFile.writeText(json.toString())
             android.util.Log.d("EnhancedCrashReporter", "✅ SDK context persisted for native crash recovery")
+            return true
         } catch (e: Exception) {
             android.util.Log.w("EnhancedCrashReporter", "Failed to persist context: ${e.message}")
+            return false
         }
     }
 

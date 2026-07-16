@@ -13,6 +13,13 @@ import java.io.File
  */
 class FileCrashStorage(private val context: Context) : CrashStorageProvider {
 
+    private companion object {
+        // Bound the UNDELIVERED backlog so it can't grow without limit in the host game when
+        // delivery is failing/offline. Kept generous + logged (never silent). Parity with iOS.
+        const val MAX_PENDING_CRASHES = 100
+        const val MAX_PENDING_AGE_MS = 30L * 24 * 60 * 60 * 1000  // 30 days
+    }
+
     private val gson: Gson = GsonBuilder()
         .setPrettyPrinting()
         .create()
@@ -42,6 +49,7 @@ class FileCrashStorage(private val context: Context) : CrashStorageProvider {
             file.writeText(json)
 
             android.util.Log.i("FileCrashStorage", "✅ Crash saved: $fileName")
+            enforcePendingLimits()
             true
         } catch (e: Exception) {
             android.util.Log.e("FileCrashStorage", "❌ Error saving crash", e)
@@ -131,6 +139,37 @@ class FileCrashStorage(private val context: Context) : CrashStorageProvider {
             android.util.Log.i("FileCrashStorage", "🗑️ All crashes deleted")
         } catch (e: Exception) {
             android.util.Log.e("FileCrashStorage", "Error deleting all crashes", e)
+        }
+    }
+
+    /**
+     * Bound the pending (undelivered) crash backlog: drop crashes older than the max age, then, if
+     * still over the count cap, drop the OLDEST. Loss is logged (never silent). Runs on the IO
+     * dispatcher via its saveCrash caller.
+     */
+    private fun enforcePendingLimits() {
+        try {
+            val now = System.currentTimeMillis()
+            var droppedAge = 0
+            crashDir.listFiles()?.filter { it.extension == "json" }?.forEach { f ->
+                if (now - f.lastModified() > MAX_PENDING_AGE_MS && f.delete()) droppedAge++
+            }
+
+            var droppedCount = 0
+            val remaining = crashDir.listFiles()?.filter { it.extension == "json" }
+                ?.sortedBy { it.lastModified() } ?: emptyList()
+            if (remaining.size > MAX_PENDING_CRASHES) {
+                remaining.take(remaining.size - MAX_PENDING_CRASHES).forEach { if (it.delete()) droppedCount++ }
+            }
+
+            if (droppedAge + droppedCount > 0) {
+                android.util.Log.w(
+                    "FileCrashStorage",
+                    "⚠️ Pending backlog over limit — dropped $droppedAge stale + $droppedCount oldest UNDELIVERED crash(es) (cap=$MAX_PENDING_CRASHES, maxAge=30d)"
+                )
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("FileCrashStorage", "Error enforcing pending limits", e)
         }
     }
 

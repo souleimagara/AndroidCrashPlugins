@@ -2,7 +2,9 @@ package com.crashreporter.library
 
 object CustomDataManager {
     private val customData = mutableMapOf<String, String>()
-    private var environment: String = "production"
+    // Default "unknown" (not "production") so a native crash recovered before setEnvironment runs
+    // on first launch can't be mislabeled as a production crash in the SLO dashboard.
+    private var environment: String = "unknown"
 
     @JvmStatic
     @JvmOverloads

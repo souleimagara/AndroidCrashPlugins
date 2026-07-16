@@ -7,12 +7,16 @@ package com.crashreporter.library
  */
 object OperationTracker {
 
+    // Single source of truth for the crash-reporter plugin version. BUMP THIS on every native
+    // plugin release so the SLO dashboard can attribute reports to the plugin build.
+    const val CRASH_REPORTER_PLUGIN_VERSION = "1.0.0"
+
     // MARK: - SDK Context (Common SLO fields)
     @Volatile
     private var sdkVersion: String = ""
 
     @Volatile
-    private var crashReporterPluginVersion: String = "1.0.0"
+    private var crashReporterPluginVersion: String = CRASH_REPORTER_PLUGIN_VERSION
 
     @Volatile
     private var platform: String = "Android"

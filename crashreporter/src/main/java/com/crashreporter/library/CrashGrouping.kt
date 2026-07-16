@@ -71,13 +71,32 @@ object CrashGrouping {
 
         // 2. Top N frames of stack trace (most important)
         val stackFrames = extractStackFrames(crashData.stackTrace)
-        components.addAll(stackFrames.take(5))  // Top 5 frames
+        if (stackFrames.isNotEmpty()) {
+            components.addAll(stackFrames.take(5))  // Top 5 frames
+        } else {
+            // No parseable frames (e.g. a location-less C# exception). Without this, EVERY
+            // stackless crash of the same type would hash to the same fingerprint and dedup would
+            // drop distinct bugs. Mix in stable, low-cardinality context so they stay distinct,
+            // using a normalized message so volatile content (ids/addresses) can't over-split.
+            components.add(normalizeMessage(crashData.exceptionMessage))
+            if (crashData.responsibleSDKComponent.isNotBlank()) components.add(crashData.responsibleSDKComponent)
+            if (crashData.currentOperation.isNotBlank()) components.add(crashData.currentOperation)
+        }
 
         // 3. Create signature
         val signature = components.joinToString("|")
 
         // 4. Hash to create short fingerprint
         return hashSignature(signature)
+    }
+
+    /** Strip volatile content (uuids, hex addresses, bare numbers) so a message is a stable key. */
+    private fun normalizeMessage(message: String): String {
+        return message
+            .replace(Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"), "UUID")
+            .replace(Regex("0x[0-9a-fA-F]+"), "0xADDR")
+            .replace(Regex("\\d+"), "N")
+            .take(120)
     }
 
     /**
@@ -104,6 +123,14 @@ object CrashGrouping {
                     if (methodPart.isNotBlank()) {
                         frames.add(methodPart)
                     }
+                }
+                // Unity C#/IL2CPP format: "Class.Method (args) (at File.cs:42)"
+                trimmed.contains("(at ") -> {
+                    frames.add(trimmed.substringBefore("(at ").trim())
+                }
+                // Unity C#/IL2CPP format: "Class.Method () [0x00000] in File.cs:0"
+                trimmed.contains("] in ") -> {
+                    frames.add(trimmed.substringBefore("[0x").substringBefore("] in ").trim())
                 }
             }
         }
@@ -219,6 +246,32 @@ object CrashGrouping {
     }
 
     /**
+     * Dedup gate for the host-driven path. Returns true if this fingerprint was already reported
+     * (24h persistent window or this session) so the caller skips it; marks it when new. Does not
+     * sample — every distinct crash is kept, only exact repeats collapse. Native crashes bypass.
+     */
+    @JvmStatic
+    fun isRecentDuplicate(fingerprint: String): Boolean {
+        if (fingerprint.isEmpty()) return false
+
+        persistentStorage?.let { storage ->
+            if (storage.wasRecentlyReported(fingerprint)) {
+                trackFingerprint(fingerprint)
+                return true
+            }
+        }
+
+        val count = trackFingerprint(fingerprint)
+        if (count > 1 && isAlreadyReported(fingerprint)) {
+            return true
+        }
+
+        markAsReported(fingerprint)
+        persistentStorage?.markAsReported(fingerprint)
+        return false
+    }
+
+    /**
      * Check if crash is fatal (app will terminate)
      */
     fun isFatalCrash(crashData: CrashData): Boolean {
@@ -254,7 +307,9 @@ object CrashGrouping {
      */
     fun optimizePayload(crashData: CrashData): CrashData {
         return crashData.copy(
-            stackTrace = limitStackTrace(crashData.stackTrace).let { st ->
+            // Scrub BEFORE the size cap — stack traces & logcat are the fields most likely to carry
+            // tokens/user-ids/secrets, and this is exactly the payload that leaves the device.
+            stackTrace = scrubText(limitStackTrace(crashData.stackTrace)).let { st ->
                 // New Relic silently rejects events with any string attribute > 4096 bytes.
                 // Cap stack trace at 3985 chars to stay safely under the limit.
                 if (st.length > 3985) st.take(3970) + "\n... [truncated]" else st
@@ -266,11 +321,10 @@ object CrashGrouping {
             customData = crashData.customData.entries.take(20).associate { it.key to scrubText(it.value) },
             exceptionMessage = scrubText(crashData.exceptionMessage),
             memoryDump = crashData.memoryDump.take(1000),
-            // New Relic rejects attribute values > 4096 bytes — cap recentLogcat safely below that
-            recentLogcat = if (crashData.recentLogcat.length > 4000)
-                crashData.recentLogcat.take(3985) + " [truncated]"
-            else
-                crashData.recentLogcat
+            // New Relic rejects attribute values > 4096 bytes — scrub then cap recentLogcat
+            recentLogcat = scrubText(crashData.recentLogcat).let { lc ->
+                if (lc.length > 4000) lc.take(3985) + " [truncated]" else lc
+            }
         )
     }
 

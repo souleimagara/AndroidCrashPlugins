@@ -14,7 +14,6 @@ import java.util.UUID
 class EnhancedCrashHandler(
     private val context: Context,
     private val crashStorage: CrashStorageProvider,
-    private val crashSender: EnhancedCrashSender,
     private val deviceInfoCollector: EnhancedDeviceInfoCollector,
     private val startupCrashDetector: StartupCrashDetector,
     private val memoryWarningTracker: MemoryWarningTracker? = null,
@@ -37,8 +36,8 @@ class EnhancedCrashHandler(
             if (startupInfo.startupCrashCount >= 5 && timeSinceBoot < 60000) {
                 android.util.Log.e("EnhancedCrashHandler", "🔁 CRASH LOOP DETECTED: ${startupInfo.startupCrashCount} crashes in ${timeSinceBoot}ms")
                 android.util.Log.e("EnhancedCrashHandler", "⛔ Disabling crash reporting to prevent infinite loop")
-                // Call original handler and exit (don't report this crash)
-                defaultHandler?.uncaughtException(thread, throwable)
+                // Skip reporting this crash and exit. Do NOT call defaultHandler here — the finally
+                // block calls it exactly once (calling it here too would invoke it twice).
                 return
             }
 
@@ -55,19 +54,8 @@ class EnhancedCrashHandler(
                 }
             }
 
-            // Try to process immediately with deduplication (non-blocking, best effort).
-            // Skipped when the host drives the signed send — the crash is already on disk and
-            // will be pulled, signed and sent by Unity C# on the next launch.
-            if (!EnhancedCrashReporter.isDeferSendToHost()) {
-                runBlocking {
-                    try {
-                        crashSender.processCrash(crashData)
-                    } catch (e: Exception) {
-                        android.util.Log.d("EnhancedCrashHandler", "Failed to process crash immediately: ${e.message}")
-                        // OK if fails, will be processed on next app launch
-                    }
-                }
-            }
+            // Crash is on disk; the Unity host pulls, signs and sends it on the next launch.
+            // (Host-driven: native never sends.)
 
         } catch (e: Exception) {
             android.util.Log.e("EnhancedCrashHandler", "Error in crash handler", e)

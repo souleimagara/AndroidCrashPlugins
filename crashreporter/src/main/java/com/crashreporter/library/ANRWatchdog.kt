@@ -34,6 +34,9 @@ class ANRWatchdog(
 
     companion object {
         private const val ANR_COOLDOWN_MS = 30000L // 30 seconds cooldown between ANR reports
+        // Overrunning the requested sleep by more than this means the OS froze the process
+        // (cached-app freezer / Doze / sleep), not a real ANR — so we skip it.
+        private const val SUSPEND_SLACK_MS = 10000L
     }
 
     init {
@@ -53,8 +56,21 @@ class ANRWatchdog(
                 // Determine appropriate sleep duration based on power save mode
                 val sleepDuration = calculateSleepDuration()
 
-                // Wait for timeout period
+                // Wait for timeout period, measuring how long we ACTUALLY slept (wall-clock).
+                val sleepStart = System.currentTimeMillis()
                 sleep(sleepDuration)
+                val actualSlept = System.currentTimeMillis() - sleepStart
+
+                // Slept far longer than asked → the OS suspended the whole process, not an app-code
+                // hang. Reset the ping and skip this cycle (false positive).
+                if (actualSlept > sleepDuration + SUSPEND_SLACK_MS) {
+                    android.util.Log.d(
+                        "ANRWatchdog",
+                        "⏸️ Process suspended during wait (asked ${sleepDuration}ms, actual ${actualSlept}ms) — not an ANR"
+                    )
+                    lastPingTime.set(System.currentTimeMillis())
+                    continue
+                }
 
                 // Check if main thread responded
                 if (!paused) {
