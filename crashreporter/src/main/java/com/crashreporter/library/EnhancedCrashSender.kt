@@ -28,6 +28,9 @@ class EnhancedCrashSender {
         crashJsonObject.addProperty("gameId", crashData.appInfo.packageName)
         // Schema version so the backend can branch parsing as the payload contract evolves.
         crashJsonObject.addProperty("payloadSchemaVersion", 1)
+        // How many times this fingerprint occurred within the dedup window (dedup collapses repeats
+        // to one report; this preserves the frequency the dashboard would otherwise lose).
+        crashJsonObject.addProperty("occurrenceCount", CrashGrouping.getOccurrenceCount(crashData.crashFingerprint))
 
         // Flatten deviceInfo
         crashJsonObject.addProperty("deviceModel", crashData.deviceInfo.model)

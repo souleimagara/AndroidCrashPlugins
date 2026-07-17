@@ -20,12 +20,31 @@ import java.io.File
 class FingerprintStorage(private val context: Context) {
 
     private val file = File(context.cacheDir, "crash_fingerprints.json")
+    private val countsFile = File(context.cacheDir, "crash_fingerprint_counts.json")
     private val gson: Gson = GsonBuilder().create()
     private val fingerprints = mutableMapOf<String, Long>()  // fingerprint → timestamp
+    private val counts = mutableMapOf<String, Int>()          // fingerprint → occurrences in window
     private val lock = Any()
 
     init {
         load()
+        loadCounts()
+    }
+
+    /** Increment and return the occurrence count for a fingerprint (survives restarts). */
+    fun incrementCount(fingerprint: String): Int {
+        if (fingerprint.isEmpty()) return 1
+        synchronized(lock) {
+            val next = (counts[fingerprint] ?: 0) + 1
+            counts[fingerprint] = next
+            saveCounts()
+            return next
+        }
+    }
+
+    /** Current occurrence count for a fingerprint (0 if unseen). */
+    fun getOccurrenceCount(fingerprint: String): Int {
+        synchronized(lock) { return counts[fingerprint] ?: 0 }
     }
 
     /**
@@ -131,6 +150,33 @@ class FingerprintStorage(private val context: Context) {
         }
     }
 
+    private fun loadCounts() {
+        synchronized(lock) {
+            try {
+                if (!countsFile.exists()) return
+                @Suppress("UNCHECKED_CAST")
+                val loaded = gson.fromJson(countsFile.readText(), Map::class.java) as? Map<String, Double>
+                if (loaded != null) {
+                    counts.clear()
+                    loaded.forEach { (fp, c) -> counts[fp] = c.toInt() }
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("FingerprintStorage", "Failed to load counts: ${e.message}")
+                counts.clear()
+            }
+        }
+    }
+
+    private fun saveCounts() {
+        synchronized(lock) {
+            try {
+                countsFile.writeText(gson.toJson(counts))
+            } catch (e: Exception) {
+                android.util.Log.e("FingerprintStorage", "Failed to save counts: ${e.message}")
+            }
+        }
+    }
+
     /**
      * Save fingerprints to disk
      */
@@ -168,6 +214,11 @@ class FingerprintStorage(private val context: Context) {
             }
             val after = fingerprints.size
             val removed = before - after
+
+            // Drop occurrence counts for fingerprints that aged out of the window too.
+            val countsBefore = counts.size
+            counts.keys.retainAll(fingerprints.keys)
+            if (counts.size != countsBefore) saveCounts()
 
             if (removed > 0) {
                 android.util.Log.d(

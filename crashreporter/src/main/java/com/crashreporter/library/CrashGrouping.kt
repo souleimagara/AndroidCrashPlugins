@@ -254,6 +254,10 @@ object CrashGrouping {
     fun isRecentDuplicate(fingerprint: String): Boolean {
         if (fingerprint.isEmpty()) return false
 
+        // Count EVERY occurrence (including suppressed duplicates) so the crash we do send can
+        // carry "seen N times" — without changing which crashes are stored/sent.
+        persistentStorage?.incrementCount(fingerprint)
+
         persistentStorage?.let { storage ->
             if (storage.wasRecentlyReported(fingerprint)) {
                 trackFingerprint(fingerprint)
@@ -269,6 +273,13 @@ object CrashGrouping {
         markAsReported(fingerprint)
         persistentStorage?.markAsReported(fingerprint)
         return false
+    }
+
+    /** Occurrence count for a fingerprint within the dedup window (min 1 so a lone crash reads 1). */
+    @JvmStatic
+    fun getOccurrenceCount(fingerprint: String): Int {
+        val c = persistentStorage?.getOccurrenceCount(fingerprint) ?: 0
+        return if (c > 0) c else 1
     }
 
     /**
