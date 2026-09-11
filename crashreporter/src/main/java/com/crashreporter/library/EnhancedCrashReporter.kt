@@ -186,12 +186,15 @@ object EnhancedCrashReporter {
             Thread.setDefaultUncaughtExceptionHandler(crashHandler)
             android.util.Log.i("EnhancedCrashReporter", "✅ Exception handler installed")
 
-            // Initialize native crash handler
-            try {
-                NativeCrashHandler.initialize(appContext)
+            // Initialize native crash handler. NativeCrashHandler.initialize swallows its own
+            // load/link errors, so check real availability instead of assuming success.
+            NativeCrashHandler.initialize(appContext)
+            if (NativeCrashHandler.isNativeCaptureAvailable()) {
                 android.util.Log.i("EnhancedCrashReporter", "✅ Native crash handler initialized")
-            } catch (e: Exception) {
-                android.util.Log.w("EnhancedCrashReporter", "Failed to initialize native crash handler: ${e.message}")
+            } else {
+                android.util.Log.e("EnhancedCrashReporter",
+                    "⚠️ Native signal-crash capture UNAVAILABLE (native library failed to load). " +
+                    "Managed exceptions + ANRs ARE still captured; native crashes (SIGSEGV/SIGABRT) will NOT be.")
             }
 
             // Process any pending native crashes from previous session (store for host to send)
@@ -236,6 +239,15 @@ object EnhancedCrashReporter {
             android.util.Log.e("EnhancedCrashReporter", "Failed to initialize: ${e.message}", e)
         }
     }
+
+    /**
+     * Whether native signal-crash capture (SIGSEGV/SIGABRT/…) is actually active this session.
+     * The host (Unity C#) can query this to know if native capture is live: false means the
+     * native library failed to load, so only managed exceptions + ANRs are captured. Safe to
+     * call regardless of native state — never calls into the native library.
+     */
+    @JvmStatic
+    fun isNativeCrashCaptureAvailable(): Boolean = NativeCrashHandler.isNativeCaptureAvailable()
 
     /**
      * Mark that app has successfully initialized (for startup crash detection)

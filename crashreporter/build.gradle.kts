@@ -23,7 +23,13 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags("-std=c++17", "-funwind-tables", "-fno-omit-frame-pointer")
-                arguments("-DANDROID_STL=c++_shared")
+                // STATIC C++ runtime: the native handler uses zero STL (only C headers), and this
+                // .so is embedded in third-party host apps. c++_shared made libcrashreporter-native.so
+                // depend on libc++_shared.so at load time, but the .aar doesn't ship that library, so
+                // dlopen() failed (UnsatisfiedLinkError) in any host app that doesn't itself bundle it
+                // (the Unity demo only worked because Unity's own native libs happen to include it).
+                // Static linking makes the .so fully self-contained (libc/liblog/libandroid only).
+                arguments("-DANDROID_STL=c++_static")
             }
         }
     }

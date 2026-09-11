@@ -10,12 +10,17 @@ import java.io.File
 object NativeCrashHandler {
 
     private var isNativeInitialized = false
+    // True only if System.loadLibrary succeeded. Kept as a plain Kotlin flag (NOT the native
+    // isInitialized() method) so callers can check availability WITHOUT calling into native —
+    // which would itself throw UnsatisfiedLinkError when the library failed to load.
+    private var nativeLibraryLoaded = false
     private lateinit var crashDir: File
 
     // Load native library
     init {
         try {
             System.loadLibrary("crashreporter-native")
+            nativeLibraryLoaded = true
             android.util.Log.i("NativeCrashHandler", "Native library loaded successfully")
         } catch (e: Throwable) {
             // loadLibrary throws UnsatisfiedLinkError (an Error, NOT an Exception) when the ABI /
@@ -26,9 +31,23 @@ object NativeCrashHandler {
     }
 
     /**
+     * Whether native signal-crash capture is actually active (library loaded AND initialized).
+     * Safe to call even when the native library is missing — never calls into native.
+     */
+    fun isNativeCaptureAvailable(): Boolean = nativeLibraryLoaded && isNativeInitialized
+
+    /**
      * Initialize native crash handler
      */
     fun initialize(context: Context) {
+        if (!nativeLibraryLoaded) {
+            // The .so never loaded — the native initialize() below would just throw
+            // UnsatisfiedLinkError. Skip it and leave capture unavailable (reported to the host).
+            android.util.Log.e("NativeCrashHandler",
+                "Native library not loaded — native signal-crash capture is UNAVAILABLE this session")
+            return
+        }
+
         if (isNativeInitialized) {
             android.util.Log.w("NativeCrashHandler", "Native crash handler already initialized")
             return
